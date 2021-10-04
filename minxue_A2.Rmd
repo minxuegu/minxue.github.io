@@ -1,0 +1,195 @@
+---
+title: "Assignment 2"
+output: html_document
+---
+
+``````{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F)
+```
+
+```{r}
+library(devtools)
+install_github('walkerke/tigris')
+library(tidyverse)
+library(sf)
+library(tigris)
+library(mapview)
+library(leaflet)
+library(censusapi)
+library(devtools)
+install_github('walkerke/tigris')
+library(tigris)
+Sys.setenv(CENSUS_KEY="60e044e0b171438ffa284a00c4a369df21caa10e")
+```
+```{r}
+smc_pop_2020 <-
+  getCensus(
+    name = "dec/pl",
+    vintage = 2020,
+    region = "block:*", 
+    regionin = "state:06+county:081",
+    vars = "P1_001N"
+  ) %>% 
+  transmute(
+    block =
+      paste0(state,county,tract,block),
+    pop2020 = P1_001N
+  )
+smc_blocks_2020 <- blocks("CA", "San Mateo", year = 2020, progress_bar = F)
+
+smc_pop_2010 <-
+  getCensus(
+    name = "dec/pl",
+    vintage = 2010,
+    region = "block:*", 
+    regionin = "state:06+county:081",
+    vars = "P001001"
+  ) %>% 
+  transmute(
+    block =
+      paste0(state,county,tract,block),
+    pop2010 = P001001
+  )
+smc_blocks_2010 <- blocks("CA", "San Mateo", year = 2010, progress_bar = F)
+```
+
+```{r}
+epa_boundary <- places("CA", progress_bar = F) %>% 
+  filter(NAME == "East Palo Alto")
+```
+
+```{r}
+place_blocks_2010 <- smc_blocks_2010 %>% 
+  st_centroid() %>% 
+  .[epa_boundary, ] 
+
+
+smc_blocks_2010 <- blocks("CA", "San Mateo", year = 2010, progress_bar = F)
+
+epa_blocks_2010 <- smc_blocks_2010 %>% 
+  st_centroid() %>% 
+  .[epa_boundary, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(smc_blocks_2010 %>% select(GEOID10)) %>% 
+  st_as_sf()
+
+epa_block_pop_2010 <- smc_pop_2010 %>% 
+  left_join(smc_blocks_2010 %>% select(block = GEOID10)) %>% 
+  st_as_sf() %>% 
+  st_centroid() %>% 
+  .[epa_boundary, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(smc_blocks_2010 %>% select(block = GEOID10)) %>% 
+  st_as_sf()
+
+mapview(epa_boundary, alpha.regions = 0) + mapview(epa_block_pop_2010)
+```
+
+
+
+```{r}
+epa_block_pop_2020 <- smc_blocks_2020 %>%
+  .[epa_block_pop_2010, ]%>% 
+ select(GEOID20)%>% 
+  left_join(smc_pop_2020, by = c("GEOID20" = "block"))
+mapview(epa_boundary, alpha.regions = 0) + mapview(epa_block_pop_2020)
+```
+
+
+```{r}
+epa_block_pop_2020_intersect <- epa_block_pop_2020 %>% 
+  st_transform(26910) %>% 
+  mutate(original_area = st_area(.))%>% 
+  st_intersection(
+    epa_block_pop_2010 %>%
+      select(block) %>% 
+      st_transform(26910)
+  ) %>% 
+  mutate(
+    leftover_area = st_area(.),
+    perc_area = as.numeric(leftover_area / original_area),
+    pop_2020_new = epa_block_pop_2020$pop2020 * perc_area
+  )
+ 
+
+```
+
+
+```{r}
+place_blocks_2020_reshaped <- epa_block_pop_2020_intersect  %>%
+  st_drop_geometry() %>% 
+  group_by(block) %>% 
+  summarize(
+    pop_2020_new = sum(pop_2020_new, na.rm=T) %>% round()
+  )
+
+
+
+```
+
+```{r}
+epa_block_pop_2010 <-
+  epa_block_pop_2010 %>% 
+  st_transform(26910)
+place_pop_2010_2020 <- epa_block_pop_2010 %>% 
+  left_join(place_blocks_2020_reshaped) %>% 
+  mutate(
+    absolute_pop = (place_blocks_2020_reshaped$pop_2020_new - epa_block_pop_2010$pop2010) / as.numeric(st_area(epa_block_pop_2010)) * 5280^2 / 1000
+  )
+mapview(place_pop_2010_2020,zcol="absolute_pop")
+```
+
+```{r}
+place_pop_2010_2020 <- 
+  place_pop_2010_2020 %>% 
+  st_transform(4326) 
+```
+
+
+```{r}
+min=min(place_pop_2010_2020$absolute_pop)
+max=max(place_pop_2010_2020$absolute_pop)
+max <- max(abs(min), abs(max))
+domain = c(-max,max)
+```
+
+
+```{r}
+
+smc_blocks_2010<-as.data.frame(smc_blocks_2010)
+absolute_pal <- colorNumeric(
+  palette = "PiYG",
+  domain = c(-max,max)
+)
+
+leaflet() %>% 
+  addProviderTiles(provider = providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = 
+      place_pop_2010_2020 %>% 
+        left_join(
+          smc_blocks_2010 %>% select(GEOID10), 
+          by = c("block" = "GEOID10")
+        ) %>% 
+        st_as_sf(),
+    stroke = F,
+    fillColor = ~absolute_pal (absolute_pop),
+    color = "white",
+    opacity = 0.5,
+    fillOpacity = 0.75,
+    weight = 1
+    )%>% 
+  addLegend(
+    data = place_pop_2010_2020,
+    pal = absolute_pal,
+    values = ~absolute_pop,
+    title = "change in population "
+  )
+```
+
+Most of the map tends to have light shades of color indicating that most census tracts where boundaries set the same between 2010 and 2020 have remained remarkably flat between 2010 and 2020. 
+A majority of neighborhoods, particularly in the eastern part of the city bound by the ocean, have seen their numbers stay stable or, in most cases, diminish. A possible source of population decline resulting from emigration in these communities may be from an existential flooding threat to these communities posed by the rise in sea level due to climate change. Another reason for the decline could be deaths during the coronavirus pandemic as East Palo Alto suffered from the pandemic.
+In the northwest, there has been varying levels of population growth, which may have resulted from the movement of people from within the city boundaries or from outside the city boundaries. In these areas efforts should be directed to more residential construction to prevent a shortage of housing resources.
+Warning about the data:
+Data floating errors are amplified when the population is made equal to the area of the scale. Especially in the boundary area, because the boundary changes greatly, but the boundary population may be small, which leads to a large error in the calculation process.
+
