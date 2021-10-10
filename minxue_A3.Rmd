@@ -1,0 +1,189 @@
+---
+title: "minxue_A3"
+output: html_document
+---
+
+``````{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warnings = F, messages = F)
+```
+
+```{r}
+library(censusapi)
+library(tidyverse)
+library(tigris)
+library(sf)
+library(leaflet)
+
+Sys.setenv(CENSUS_KEY="c8aa67e4086b4b5ce3a8717f59faa9a28f611dab")
+```
+
+```{r}
+pums_2019_1yr <- getCensus(
+  name = "acs/acs1/pums",
+  vintage = 2019,
+  region = "public use microdata area:*", 
+  regionin = "state:06",
+  vars = c(
+    "SERIALNO",
+    "SPORDER",
+    "PWGTP",
+    "WGTP",
+    "YBL",
+    "KIT",
+    "HINCP",
+    "AGEP",
+    "BLD"
+  )
+)
+```
+
+
+
+```{r}
+bay_county_names <-
+  c(
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  )
+
+bay_counties <-
+  counties("CA", cb = T, progress_bar = F) %>%
+  filter(NAME %in% bay_county_names)
+```
+
+
+```{r}
+ca_pumas <-
+  pumas("CA", cb = T, progress_bar = F)
+
+bay_pumas <-
+  ca_pumas %>% 
+  st_centroid() %>% 
+  .[bay_counties, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(ca_pumas %>% select(GEOID10)) %>% 
+  st_as_sf()
+```
+
+```{r}
+bay_pums <-
+  pums_2019_1yr %>% 
+  mutate(
+    PUMA = str_pad(public_use_microdata_area,5,"left","0")
+  ) %>% 
+  filter(PUMA %in% bay_pumas$PUMACE10)
+
+```
+
+```{r}
+bay_pums_example <-
+  bay_pums %>% 
+  filter(!duplicated(SERIALNO)) %>% 
+  mutate(
+    WGTP = as.numeric(WGTP),
+    high_risk_population = ifelse(
+      (YBL < 05) &
+        (HINCP < 60000)&
+        (AGEP<6|AGEP>64)&
+        (KIT ==2)|(BLD ==01)&
+        (AGEP<6|AGEP>64)&
+        (HINCP < 60000)&(KIT ==2),
+      WGTP,
+      0
+    )
+  ) %>% 
+  group_by(PUMA) %>% 
+  summarize(
+    high_risk_population =
+      sum(high_risk_population, na.rm =T)/sum(WGTP, na.rm = T)*100
+  ) %>% 
+  left_join(
+    bay_pumas %>% 
+      select(PUMACE10),
+    by = c("PUMA" = "PUMACE10")
+  ) %>% 
+  st_as_sf()
+```
+
+```{r}
+pums_pal <- colorNumeric(
+  palette = "Oranges",
+  domain = bay_pums_example$perhigh_risk_population
+)
+
+leaflet() %>%
+  addTiles() %>% 
+  addPolygons(
+    data = bay_pums_example,
+    fillColor = ~pums_pal(high_risk_population),
+    color = "white",
+    opacity = 0.5,
+    fillOpacity = 0.5,
+    weight = 1,
+    label = ~paste0(
+      round(high_risk_population), 
+      "% "
+    ),
+    highlightOptions = highlightOptions(
+      weight = 2,
+      opacity = 1
+    )
+  ) %>% 
+  addLegend( data = bay_pums_example,
+    bins=5,
+    pal = pums_pal,
+    values = ~high_risk_population,
+    title = "Low-income households with elderly or children </br> 
+    living in houses more than 50 yrs
+    without complete kitchen appliances </br>
+    / mobile homes"
+  )
+```
+
+```{r}
+high_risk_population_number <-
+  bay_pums %>% 
+  filter(!duplicated(SERIALNO)) %>% 
+  mutate(WGTP = as.numeric(WGTP),
+    high_risk_population_number = ifelse(
+      (YBL < 05) &
+        (HINCP < 60000)&
+        (AGEP<6|AGEP>64)&
+        (KIT ==2)|(BLD ==01)&
+        (AGEP<6|AGEP>64)&
+        (HINCP < 60000)&(KIT ==2),
+      WGTP,
+      0
+    )
+  )
+```
+
+
+```{r}
+high_risk_population_number <-
+    summarize(
+    high_risk_population_number,Total_population=
+      sum(high_risk_population_number, na.rm =T)
+  )
+
+high_risk_population_number 
+```
+As heat waves are already increasing, and their frequency, intensity and duration are likely to continue to increase due to climate change, concern about the health effects of heat has expanded. Creating and mapping a heat vulnerability index using household age, income, and housing conditions as indicators of vulnerability facilitates understanding who is most vulnerable to the health effects of extreme heat.
+
+Adults 65 and older have a higher-than-average risk of heat-related death. Children are particularly vulnerable to heat-related illness and death because their bodies are less adapted to heat than adults and they must rely on others to protect them. Use AGEP to address these groups of people.
+
+Air conditioning is not a standard amenity for most older houses, especially those older than 50 years. For older homeowners, this poses serious problems during the hot summer months. Using YBL to indicate when the house was first built, YBL < 05 means a house built before 1970 and is over 50 years old. In addition, living in a mobile home such as a trailer without air conditioning can be very dangerous, and since mobile homes tend to be very young, I consider it as a separate category. Use BLD = 01 to calculate.
+
+People who are economically disadvantaged are particularly vulnerable to excessive heat exposure. Concerns about the cost of running air conditioning are a major barrier to staying cool, and lower-income people may be less willing to respond to warnings and pay for transport to cooler areas. According to the US Census Bureau, the Median Household Income in 2021 was about $60,000. Use HINCP < 60000 to indicate households with a household income of less than $60,000 per year. 
+
+During the group prompt, the presence of household facilities, such as potable water in the room, a refrigerator to keep food fresh is accentuated. Our group believe that the presence of household amenities like faucets and refrigerators means access to water and sanitation, which can reduce the risk of diseases such as dehydration due to heat waves. Use KIT==2 to indicate households without complete kitchen utilities.
+
+More help should be placed in places with high concentrations of people at risk of heatwaves as shown in the darker shades of areas, like mandating outdoor workers to stop working on hot days, and providing free air conditioning and drinking water in places such as libraries for families without essetial facilities to cope with heat waves.
+
