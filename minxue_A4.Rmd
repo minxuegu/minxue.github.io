@@ -368,6 +368,7 @@ bay_education_ethnicity_2019 %>%
 
 
 ```
+
 There is a visual education attainment disparity by ethnicity in the bay area. Unfortunately, Hispanics make up over the half of people who haven't got a degree beyond high school, while White people alone only take up a small fraction. This reveals a severe problem and a huge inequality among different ethnicity which the race graph is unable to provide.
 
 
