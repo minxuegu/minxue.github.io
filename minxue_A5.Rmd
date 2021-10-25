@@ -1,0 +1,189 @@
+---
+title: "A5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, messages = FALSE,error=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tigris)
+library(leaflet)
+library(censusapi)
+library(readxl)
+library(mapview)
+
+Sys.setenv(CENSUS_KEY="60e044e0b171438ffa284a00c4a369df21caa10e")
+```
+
+
+```{r}
+
+ces4 <- read_excel(("calenviroscreen40resultsdatadictionary_F_2021.xlsx"), 
+  sheet = "CES4.0FINAL_results")
+
+```
+
+```{r}
+
+ces4_clean <-ces4 %>%
+  dplyr::select(!ends_with("Pctl"))
+```
+
+```{r}
+bay_county_names <-
+  c(
+    "Alameda",
+    "Contra Costa",
+    "Marin",
+    "Napa",
+    "San Francisco",
+    "San Mateo",
+    "Santa Clara",
+    "Solano",
+    "Sonoma"
+  )
+
+ca_tracts <- tracts("CA", cb = T, progress_bar = F)
+```
+
+
+```{r}
+ces4_bay_pm25 <-
+  ces4_clean %>% 
+  filter(`California County` %in% bay_county_names) %>% 
+  select(`Census Tract`, PM2.5) %>% 
+  left_join(
+    ca_tracts %>% 
+      transmute(GEOID = as.numeric(GEOID)), 
+    by = c("Census Tract" = "GEOID")
+  ) %>% 
+  st_as_sf()
+
+pm25_pal <- colorNumeric(
+  palette = "Reds",
+  domain = ces4_bay_pm25$PM2.5
+)
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = ces4_bay_pm25,
+    fillColor = ~pm25_pal(PM2.5),
+    color = "white",
+    weight = 0.5,
+    fillOpacity = 0.5,
+    label = ~PM2.5
+  )
+```
+
+```{r}
+PM2.5=mean(ces4_bay_pm25$PM2.5,na.rm = TRUE)
+```
+  The plot us derived from annual mean concentration of PM2.5 (weighted average of measured monitor concentrations and satellite observations, µg/m3), （Air Monitoring Network, Satellite Remote Sensing Data; California Air Resources Board (CARB)）over three years (2015 to 2017).
+  Generally speaking, PM2.5 index is relatively average with Vallejo and Oakland being slightly higher, which can also be seen from the figure where there is little color difference between different regions.
+  Mobile emissions from motor vehicles, ships, planes, and trains comprise the largest source of air pollution in PM2.5. Wildfires are an additional important source of PM2.5 in California as smoke particles fall almost entirely within the size range of PM2.5.
+
+```{r}
+ces4_bay_Asthma <-
+  ces4 %>% 
+  filter(`California County` %in% bay_county_names) %>% 
+  select(`Census Tract`, Asthma) %>% 
+  left_join(
+    ca_tracts %>% 
+      transmute(GEOID = as.numeric(GEOID)), 
+    by = c("Census Tract" = "GEOID")
+  ) %>% 
+  st_as_sf()
+
+Asthma_pal <- colorNumeric(
+  palette = "Reds",
+  domain = ces4_bay_Asthma$Asthma
+)
+
+leaflet() %>% 
+  addProviderTiles(providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = ces4_bay_Asthma,
+    fillColor = ~Asthma_pal(Asthma),
+    color = "white",
+    weight = 0.5,
+    fillOpacity = 0.5,
+    label = ~Asthma
+  )
+
+```
+
+```{r}
+Asthma=mean(ces4_bay_Asthma$Asthma,na.rm = TRUE)
+```
+
+  The plot is derived from spatially modeled, (California ZIP codes)age-adjusted,（using Tracking California) rate of ED visits (Emergency Department and Patient Discharge Datasets from the State of California, Office of Statewide Health Planning and Development (OSHPD)) for asthma per 10,000 (averaged over 2015-2017).
+  Asthma increases an individual’s sensitivity to pollutants. A study found that there was an increase in asthma diagnosis following increases in ambient air pollution and exposure to certain pesticides.     Vallejo, Antioch and Oakland has the highest index in term of asthma rate, more than triple the CA number(52.14), this may be due to the high density of freeways throughout the county , pesticide used on agriculture crops like plane spraying crops with chemicals on a reoccurring basis and second hand smoke coupled with poor housing conditions.
+
+
+
+```{r}
+ces4_bay_Asthma <- as.data.frame(ces4_bay_Asthma)
+ces4_bay_pm25<- as.data.frame(ces4_bay_pm25)
+combined <- merge(ces4_bay_Asthma,ces4_bay_pm25)
+ggplot(
+  data = combined,
+  aes(
+      x = PM2.5,
+      y = Asthma
+    )
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+  
+  
+  When THE PM2.5 value was small, the curve fitting was better, but when THE PM2.5 value was large, the specific value of asthma had a large residual difference with the fitted value, which was outside the curve and had a poor correlation with PM2.5, proving that there were other causes causing asthma
+```{r}
+model <- lm(Asthma ~ PM2.5, combined)
+summary(model)
+```
+ 
+ 
+  An increase of 19.862 in Asthma is associated with an increase of 1 in PM2.5 ; 9.6% of the variation in Asthma is explained by the variation in PM2.5
+
+```{r}
+plot(density(residuals(model)))
+```
+ 
+ 
+  As is shown in the plot, the mean of the residual is negative, and there appears to be a sharp skew to the left of the density curve for the residuals while it should be a symmetric bell curve centered at 0.
+
+```{r}
+combined <- combined %>%
+  mutate(logAsthma=log(Asthma))
+ggplot(
+  data = combined,
+  aes(
+      x = PM2.5,
+      y = logAsthma
+    )
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+```{r}
+model1 <- lm(logAsthma ~ PM2.5, combined)
+summary(model1)
+```
+  An increase of 0.356 in log(Asthma) is associated with an increase of 1 in PM2.5 ; 10% of the variation in Asthma is explained by the variation in PM2.5
+
+```{r}
+plot(density(residuals(model1)))
+```
+  
+  
+  After applying a logarithmic transformation to the model, the curve as a whole is closer to a normal distribution but the normal distribution is concave downwards rather than upwards.
+
+
+
