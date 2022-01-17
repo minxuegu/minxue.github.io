@@ -1,0 +1,734 @@
+title: "assignment1"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE, messages = FALSE,error=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(plotly)
+library(tigris)
+library(censusapi)
+library(sf)
+library(leaflet)
+library(tidycensus)
+library(mapview)
+Sys.setenv(CENSUS_KEY="60e044e0b171438ffa284a00c4a369df21caa10e")
+```
+1.1
+（1）Load Data
+```{r}
+acs_vars_2019_5yr <-
+  listCensusMetadata(
+    name = "2019/acs/acs5",
+    type = "variables"
+  )
+ca_places <- places(state="CA", cb = T, progress_bar = F)
+```
+
+```{r}
+Rent_percentage <-
+  getCensus(
+    name = "acs/acs5",
+    vintage = 2019,
+    region = "place:*",
+    regionin = "state:06",
+    vars = "group(B25074)"
+  ) %>% left_join(
+    ca_places %>% 
+      select(PLACEFP), 
+    by = c("place" = "PLACEFP") 
+)  %>%
+  select(!c(GEO_ID,state,place,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_5yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  )%>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"RENTER COSTS","percentage"),
+    sep = "!!"
+  ) %>% 
+  filter(!is.na(percentage))%>% 
+  left_join(
+    ca_places %>% 
+      select(PLACEFP), 
+    by = c("geometry" = "geometry")
+  )
+
+Ownercosts_percentage <-
+  getCensus(
+    name = "acs/acs5",
+    vintage = 2019,
+    region = "place:*",
+    regionin = "state:06",
+    vars = "group(B25095)"
+  ) %>%  left_join(
+    ca_places %>% 
+      select(PLACEFP), 
+    by = c("place" = "PLACEFP")
+)%>%
+  select(!c(GEO_ID,state,place,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_5yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  )%>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"OWNER COSTS","percentage"),
+    sep = "!!"
+  ) %>% 
+  filter(!is.na(percentage)) %>% 
+  left_join(
+    ca_places %>% 
+      select(PLACEFP), 
+    by = c("geometry" = "geometry")
+  )
+```
+
+```{r}
+epa_boundary <- places("CA", progress_bar = F) %>% 
+  filter(NAME == "East Palo Alto")
+```
+
+```{r}
+Rent_percentage <- Rent_percentage %>% 
+  left_join(ca_places %>% select(PLACEFP = PLACEFP)) %>% 
+  st_as_sf() %>% 
+  st_centroid() %>% 
+  .[epa_boundary, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(ca_places %>% select(PLACEFP = PLACEFP))%>% 
+  st_as_sf() 
+
+Ownercosts_percentage <- Ownercosts_percentage %>% 
+  left_join(ca_places %>% select(PLACEFP = PLACEFP)) %>% 
+  st_as_sf() %>% 
+  st_centroid() %>% 
+  .[epa_boundary, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(ca_places %>% select(PLACEFP = PLACEFP))%>% 
+  st_as_sf() 
+```
+
+
+（2）Housing burden characterization and visualization
+```{r}
+Ownercosts_percentage_epa <- 
+  Ownercosts_percentage %>% mutate(
+    burden_type= case_when(
+      percentage %in% c(
+          "Less than 20.0 percent",
+          "20.0 to 24.9 percent",
+          "25.0 to 29.9 percent"
+        ) ~ "low_burden",
+      percentage %in% c(
+          "30.0 to 34.9 percent",
+          "35.0 to 39.9 percent",
+          "40.0 to 49.9 percent"
+        ) ~ "burdened",
+      percentage %in% c(
+          "50.0 percent or more"
+        ) ~ "severely_burdened")
+    ) %>% 
+  st_drop_geometry()  %>% as.data.frame()%>% 
+  group_by(burden_type) %>% 
+  summarize(
+    total_pop = sum(estimate, na.rm = T)
+  ) %>% 
+  mutate(type = "owner")%>% 
+  mutate(all_owner = sum(total_pop))%>%
+  filter(!is.na(burden_type))%>%
+  select(-all_owner)
+
+Rent_percentage_epa <- 
+  Rent_percentage %>% mutate(
+    burden_type= case_when(
+      percentage %in% c(
+          "Less than 20.0 percent",
+          "20.0 to 24.9 percent",
+          "25.0 to 29.9 percent"
+        ) ~ "low_burden",
+      percentage %in% c(
+          "30.0 to 34.9 percent",
+          "35.0 to 39.9 percent",
+          "40.0 to 49.9 percent"
+        ) ~ "burdened",
+      percentage %in% c(
+          "50.0 percent or more"
+        ) ~ "severely_burdened")
+    ) %>% 
+  st_drop_geometry()  %>% as.data.frame()%>% 
+  group_by(burden_type) %>% 
+  summarize(
+    total_pop = sum(estimate, na.rm = T)
+  ) %>% 
+  mutate(type = "renter")%>% 
+  mutate(all_renter = sum(total_pop))%>%
+  filter(!is.na(burden_type))%>%
+  select(-all_renter)
+```
+
+We assume a threshold of 30% as burdened population, and a 50% threshold as severely-burdened population, anyone below 30% is considered low burden.
+```{r}
+epa_burdened  <- rbind(Rent_percentage_epa , Ownercosts_percentage_epa)
+
+epa_burdened <-
+  epa_burdened %>% 
+  group_by(burden_type, type) %>% 
+  summarize(total_pop = sum(total_pop)) %>% 
+  rbind(
+    epa_burdened %>% 
+      group_by(type) %>% 
+      summarize(total_pop = sum(total_pop)) %>% 
+      mutate(burden_type = "Total")
+  )%>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = burden_type,
+      y = total_pop,
+      fill = type
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "Housing burden",
+    y = "population",
+    title = "Burdened population composition",
+    fill = "type of household (owner or renter occupied)"
+  )+ coord_flip()
+epa_burdened 
+```
+```{r}
+`overall % of renter-occupied units` = 3066/(3066+4466)
+
+` overall % of severely burdened households that are renter households` = 1367/(1367+673)
+
+
+` % of severely burdened households that are owner households` = 673/(1367+673)
+
+```
+The housing population of EPA is made up of 60% of renter population and 40% of household owners.
+The severely burdened population is made up of 67% of renter population and 33% of household owners.
+From the plot and the data frame, we can see that the majority of the EPA population are tenants，and tenants disproportionately comprise the majority of burdened and severely burdened households.
+
+
+（3）EPA Moving status
+```{r}
+move <-
+  getCensus(
+    name = "acs/acs5",
+    vintage = 2019,
+    region = "place:*",
+    regionin = "state:06",
+    vars = "group(B07413)"
+  ) %>% left_join(
+    ca_places %>% 
+      select(PLACEFP), 
+    by = c("place" = "PLACEFP") 
+) %>%
+  select(!c(GEO_ID,state,place,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_5yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  )%>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"Move","Type"),
+    sep = "!!"
+  ) 
+  
+```
+
+```{r}
+move_epa<- move  %>% 
+  left_join(ca_places %>% select(PLACEFP = PLACEFP)) %>% 
+  st_as_sf() %>% 
+  st_centroid() %>% 
+  .[epa_boundary, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(ca_places %>% select(PLACEFP = PLACEFP))%>%filter(!is.na(Type))%>% 
+  group_by(Move, Type) %>%
+summarize(estimate = sum(estimate))
+```
+
+```{r}
+move_epa <-
+  move_epa %>% 
+  group_by(Move, Type) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  rbind(
+    move_epa %>% 
+      group_by(Type) %>% 
+      summarize(estimate = sum(estimate)) %>% 
+      mutate(Move = "Total")
+  )  %>%ggplot() +
+  geom_bar(
+    aes(
+      x = Move,
+      y = estimate,
+      fill = Type
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "household type (renter/owner occupied)",
+    y = "population",
+    title = "Moving situation by household type",
+    fill = "Move status"
+  )+ coord_flip()
+move_epa 
+```
+The housing market in 2019 EPA has not undergone significant restructuring, but tenants are more likely  to relocate to other counties than house owners. This may be due to the fact that the new place is more suitable for them, or it may be due to their inability to support rents，
+
+
+（4）Racial bias in San Mateo housing 
+```{r}
+census_race_categories <- 
+  c(
+    "White Alone",
+    "Black or African American",
+    "American Indian and Alaska Native Alone",
+    "Asian Alone",
+    "Native Hawaiian and Other Pacific Islander Alone",
+    "Some Other Race Alone",
+    "Two or More Races"
+  )
+
+bay_tenure_race <-
+  1:7 %>% 
+  map_dfr(function(x){
+    getCensus(
+      name = "acs/acs5",
+      vintage = 2019,
+      region = "county:081",
+      regionin = "state:06",
+      vars = paste0("group(B25003",LETTERS[x],")")
+    ) %>%
+      select(!c(GEO_ID,state,NAME) & !ends_with(c("EA","MA","M"))) %>%
+      pivot_longer(
+        ends_with("E"),
+        names_to = "name",
+        values_to = "estimate"
+      ) %>%
+      left_join(
+        acs_vars_2019_5yr %>% 
+          select(name, label)
+      ) %>% 
+      select(-name) %>% 
+      separate(
+        label,
+        into = c(NA,NA,"tenure"),
+        sep = "!!"
+      ) %>% 
+      filter(!is.na(tenure)) %>% 
+      mutate(race = census_race_categories[x])
+  })
+
+bay_tenure_race %>% 
+  group_by(tenure, race) %>% 
+  summarize(estimate = sum(estimate)) %>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = tenure,
+      y = estimate,
+      fill = race
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "household type (renter/owner occupied)",
+    y = "population",
+    title = "Bay Area household composition by race",
+    fill = "Race of householder"
+  )+ coord_flip()
+```
+
+```{r}
+bay_counties <-
+  counties("CA", cb = T, progress_bar = F) %>%
+  filter(NAME == "San Mateo")
+
+ca_pumas <-
+  pumas("CA", cb = T, progress_bar = F)
+
+sm_pumas <-
+  ca_pumas %>% 
+  st_centroid() %>% 
+  .[bay_counties, ] %>% 
+  st_set_geometry(NULL) %>% 
+  left_join(ca_pumas %>% select(GEOID10)) %>% 
+  st_as_sf()
+
+pums_vars_2019 <- 
+  pums_variables %>%
+  filter(year == 2019, survey == "acs5")
+```
+
+```{r}
+ca_pums <- readRDS("ca_pums.rds")
+sm_pums <-
+  ca_pums %>% 
+  filter(PUMA %in% sm_pumas$PUMACE10) 
+```
+
+```{r}
+burden_threshold <- 0.3
+
+sm_burden <-
+  sm_pums %>% 
+  filter(HINCP > 0) %>%
+  filter(SPORDER == 1) %>% 
+  transmute(
+    RAC1P = RAC1P,
+    PUMA = PUMA,
+    weight = WGTP,
+    housingcost = ifelse(
+      SMOCP > 0,
+      SMOCP*12*as.numeric(ADJHSG),
+      GRNTP*12*as.numeric(ADJHSG)
+    ),
+    income = HINCP*as.numeric(ADJINC),
+    burden_perc = housingcost/income,
+    burden_30 = housingcost - burden_threshold*income,
+    incomegap_30 = housingcost/burden_threshold - income
+  )
+```
+
+```{r}
+sm_burden_pumas <-
+  sm_burden %>% mutate(
+    burdened_30 = ifelse(
+      burden_perc >= burden_threshold,
+      weight,
+      0
+    ),
+    excess_30 = ifelse(
+      burden_30 < 0,
+      burden_30,
+      0
+    ),
+    burden_30 = ifelse(
+      burden_30 > 0,
+      burden_30,
+      0
+    ),
+    incomegap_30 = ifelse(
+      incomegap_30 > 0,
+      incomegap_30,
+      0
+    )
+  )%>% mutate(race = case_when(
+      RAC1P == "1" ~ "white",
+      RAC1P == "2" ~ "black",
+      RAC1P == "6" ~ "asian",
+      TRUE ~ "other"
+    )
+  )%>% group_by(PUMA,race) %>% 
+  summarize(
+    burdened_30 = sum(burdened_30),
+    households = sum(weight),
+    burden_30 = sum(burden_30*weight),
+    incomegap_30 = sum(incomegap_30*weight),
+    excess_30 = sum(excess_30*weight)
+  ) 
+```
+
+```{r}
+sm_burden_pumas_white <- sm_burden_pumas %>%filter(race== 'white')
+sum(sm_burden_pumas_white$burdened_30)/sum(sm_burden_pumas_white$households)
+sm_burden_pumas_black <- sm_burden_pumas %>%filter(race== 'black')
+sum(sm_burden_pumas_black$burdened_30)/sum(sm_burden_pumas_black$households)
+sm_burden_pumas_asian <- sm_burden_pumas %>%filter(race== 'asian')
+sum(sm_burden_pumas_asian$burdened_30)/sum(sm_burden_pumas_asian$households)
+```
+
+```{r}
+sm_burden_pumas_incomegap <- sm_burden_pumas %>% group_by(PUMA)%>% 
+  summarize(
+    incomegap_30 = sum(incomegap_30)
+   )%>% 
+  left_join(sm_pumas %>% select(PUMA = PUMACE10)) %>% 
+  st_as_sf()
+
+burden_pal <- colorNumeric(
+  palette = "Purples",
+  domain = sm_burden_pumas_incomegap$incomegap_30
+)
+
+sm_burden_pumas_incomegap  %>% 
+  leaflet() %>% 
+  addPolygons(
+    fillColor = ~burden_pal(incomegap_30),
+    fillOpacity = 0.5,
+    color = "white",
+    weight = 0.5,
+    label = ~paste0(round(incomegap_30), ""),
+    highlightOptions = highlightOptions(
+      weight = 2
+    )
+  ) %>% 
+  addLegend(
+    pal = burden_pal,
+    values = ~incomegap_30,
+    title = "% income_gap"
+  )
+
+```
+Since pums data cannot be filtered to EPA, San Mateo is used as the geographic range for the analysis of the racial distribution of housing. From the data frame, White and Asian households make up the majority of both tenants and landlords population in San Mateo, and White and Asian households are mostly house owners. While Black and other ethnic groups have fewer households in EPA and have more tenants than house owners. When assuming that households with housing costs exceeding 30% of income are burdened, 33% of White households, 45% of Black households and 32% of Asian households are housing burdened. Blacks have significantly higher housing burden than Asians and Whites.The map shows the total annual funding required to remove the housing burden for all populations to have a housing burden of less than 30% of income. From the map, places in Redwood City, Menlo Park seem to require the most money, meaning people's housing issues are most severe.
+
+
+2.3
+
+（1）Load data
+```{r}
+library(esri2sf)
+
+epa_zoning <- esri2sf("https://services8.arcgis.com/0IC8hha3hgQkmGoa/arcgis/rest/services/EastPaloAltoZoning_2021_WFL1/FeatureServer/1")
+
+sm_secured = read_csv("Secured_Property_Taxes.csv")
+```
+
+```{r}
+epa_zones <-
+  epa_zoning %>% 
+  left_join(
+    sm_secured %>% 
+      mutate(
+        APN = `Parcel Number`%>% 
+           str_remove_all("-"))
+  )%>% 
+  filter(!is.na(APN)) %>% 
+  filter(New_Zone == 'R-LD')%>% 
+  filter(!is.na(APN)) %>% 
+  filter(New_Zone == 'R-LD') %>% 
+  mutate(tenure = ifelse(
+      Exemption == 0,
+      "Renter occupied:",
+      "Owner occupied:"
+    )
+  )   
+```
+
+We filter to R-LD (Low Density Residential) and assume R-LD to be single-family home in the EPA. We also assume the $5,600 and $7,000 in the exemption column are owner-occupiers and $0 means the house is occupied by tenants.
+
+（2）propertyvalue
+```{r}
+epa_zones_propertyvalue <-
+  epa_zones%>% select('Assessed Value','Fiscal Year','Shape__Area','APN','tenure') %>% st_drop_geometry()  %>% as.data.frame()
+```
+
+```{r}
+epa_propertyvalue <- epa_zones_propertyvalue %>%
+ group_by( `Fiscal Year`) %>% 
+  summarize(TOTALvalue = 
+      sum(`Assessed Value` %>% as.numeric(), 
+        na.rm = T
+      ),
+    TOTALarea =
+      sum(
+        Shape__Area  %>% as.numeric(), 
+        na.rm = T
+      )
+  ) %>% 
+  mutate(
+    AVERAGEvalue =
+      TOTALvalue/TOTALarea
+  )
+```
+
+```{r}
+plot_ly() %>% 
+  add_trace(
+        data = epa_propertyvalue,
+        x = ~`Fiscal Year`,
+        y = ~`AVERAGEvalue`,
+        type = "scatter",
+        mode = "lines")%>% 
+  layout(
+    title = "average property value from 2015/2016 to 2018/2019", 
+    xaxis = list(
+      title = "Year"
+    ),
+    yaxis = list(
+      title = "average property value"
+    )
+  ) %>% 
+  config(displayModeBar = F)
+```
+We use 4 different fiscal years to assess changes in  property values. We use the ratio of total assessed value to land area to characterize the increase in land value per unit area, which more clearly reflects the effect of a single time factor. From the graph we can see that land values are increasing every year, which could lead to a greater housing burden for renters and house owners.
+
+
+（3）change in ownership
+```{r}
+epa_tenure <- epa_zones_propertyvalue %>%
+  mutate(tenure_renter = ifelse(
+      tenure == "Renter occupied:",
+      1,
+      0
+    )
+  )%>% 
+  mutate(tenure_owner = ifelse(
+      tenure == "Owner occupied:",
+      1,
+      0
+    )
+  )
+
+epa_tenure<-
+  epa_tenure%>%
+  group_by( `Fiscal Year`) %>%
+    summarize(total_renter_tenure = 
+      sum(tenure_renter %>% as.numeric(), 
+        na.rm = T
+      ),
+    total_owner_tenure = 
+      sum(tenure_owner %>% as.numeric(), 
+        na.rm = T
+      )
+    )
+```
+
+```{r}
+plot_ly() %>% 
+  add_trace(
+        data = epa_tenure,
+        x = ~`Fiscal Year`,
+        y = ~`total_renter_tenure`,
+        type = "scatter",
+        mode = "lines",
+        name = "renter-occupied tenure")%>%
+  add_trace(
+        data = epa_tenure,
+        x = ~`Fiscal Year`,
+        y = ~`total_owner_tenure`,
+        type = "scatter",
+        mode = "lines",
+        name = "owner-occupied tenure")%>%
+  layout(
+    title = "total renter/owner occupied tenure from 2015/2016 to 2018/2019", 
+    xaxis = list(
+      title = "Year"
+    ),
+    yaxis = list(
+      title = "total tenure"
+    )
+  ) %>% 
+  config(displayModeBar = F)
+```
+
+```{r}
+leaflet() %>% 
+  addProviderTiles(provider = providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data = epa_zones %>% 
+      filter(`Fiscal Year` == "2015/2016")%>% 
+      filter(Exemption %in% c(5600,7000)),
+    fillColor = "yellow",
+    color = "black",
+    weight = 0.5,
+    fillOpacity = 0.3,
+    group = '2016'
+  ) %>% 
+  addPolygons(
+    data = epa_zones %>% 
+      filter(`Fiscal Year` == "2016/2017") %>% 
+      filter(Exemption %in% c(5600,7000)),
+    fillColor = "blue",
+    color = "black",
+    weight = 0.5,
+    fillOpacity = 0.3,
+    group = '2017'
+  )%>% 
+  addPolygons(
+    data = epa_zones %>% 
+      filter(`Fiscal Year` == "2017/2018") %>% 
+      filter(Exemption %in% c(5600,7000)),
+    fillColor = "red",
+    color = "black",
+    weight = 0.5,
+    fillOpacity = 0.3,
+    group = '2018'
+  )%>% 
+  addPolygons(
+    data = epa_zones %>% 
+      filter(`Fiscal Year` == "2018/2019") %>% 
+      filter(Exemption %in% c(5600,7000)),
+    fillColor = "green",
+    color = "black",
+    weight = 0.5,
+    fillOpacity = 0.3,
+    group = '2019'
+  )%>%
+  addLayersControl(
+    baseGroups = "2016",
+    overlayGroups = c("2017","2018","2019"),
+    options = layersControlOptions(collapsed = FALSE))
+```
+
+```{r}
+epa_tenure_change <- epa_zones_propertyvalue %>%
+  mutate(tenure_renter = ifelse(
+      tenure == "Renter occupied:",
+      1,
+      0
+    )
+  ) %>% group_by(APN) %>% mutate(Change = sum(tenure_renter)) %>% summarise_all(first) %>% mutate(if_change = ifelse(
+      Change == 4 | Change == 0 ,
+      0,
+      1
+    )) %>% filter(!is.na(if_change)) %>% left_join(epa_zoning%>%select(APN)) %>%st_as_sf()
+```
+
+
+```{r}
+leaflet() %>% 
+  addProviderTiles(provider = providers$CartoDB.Positron) %>% 
+  addPolygons(
+    data =epa_tenure_change,
+    fillColor = ~ifelse(if_change == 0, "red", "blue"),
+    color = ~ifelse(if_change == 0, "red", "blue"),
+    weight = 0.5,
+    fillOpacity = 0.5
+  )
+```
+From the straight line, tenants make up the majority and the number of tenants is increasing year by year, while the number of house owners is decreasing year by year.Figure 1 shows the specific identity of each parcel between 2015 and 2018, the colored parcel indicates renters, and Figure 2 shows whether there has been any change in the residents over the past four years, red means no change, and blue means changes in household status.The number of tenant status changes was small and evenly distributed throughout the EPA.
+
+Report:
+  In a house leasing relationship, the main rights and obligations are that the lessee uses the house and pays the rent, and the lessor delivers the house and collects the rent. However, when the lessor wants to sell or auction the rented house, if there are no restrictions and constraints on the lessor to sell or auction, this will strengthen the contradiction between the lessee and the lessor, that is, the lessor can terminate the contract and cause the lessee to face  housing crisis due to short-term forced evictions. The impact of the pandemic and the expiry of eviction moratoriums have exacerbated the crisis, putting millions of Americans again at risk of losing their homes. Life problems are people's livelihood problems, and if they are not handled properly, social conflicts will be intensified. As a result, the EPA administration has discussed a visionary new bill that could help our cities move towards a more just housing system.
+  OPA is an anti-displacement housing policy that gives tenants the option of having safe housing when their rental property is listed for sale, while also preserving affordable housing. Tenants, if landlords plan to sell their homes, will receive early notice and the opportunity to buy a residence collectively.
+  Supporters of the law argue that the ordinance gives the tenant first right to purchase a property either a rental property or a single-family home before it can go on the general market for sales which provides them an opportunity to continue to live longer in the city they love. At the same time, sales are conducted at market price to protect homeowners, who can find the highest bidder on the open market and freely sell the property to the buyer that suits them best. However, the introduction of the law has received opposition from many homeowners. The protests are mainly about losing their properties and hard-earned rights because they believe that renters will drive down prices and shift housing burden from renters to homeowners, while extended transaction times make it difficult to sell homes, and at the same time, more of administrators and related litigation has resulted in a heavier burden on taxpayers.
+  From my perspective, granting the lessee the right of first purchase is not a restriction for the lessor to buy and sell houses, but the maintenance of the basic social order. And the conflict is the result of incorrect policy communication and imperfect legal details. 
+  Firstly，the law targets outside investors, not local homeowners. In East Palo Alto, nearly a third of housing units are owned by out-of-home landlords, the purpose of the OPA is to protect the community from those outside investors, who may hold large sums of money to buy EPA houses at a low price and sell them at a high price after remodeling, thus making it difficult for local EPA tenants to maintain their stay in EPA. The ordinance included all uninhabited single-family dwellings at first, but with the progress of the meeting, local residents will be exempted even if they have multiple non-self-owned houses, further protecting the rights and interests of EPA residents.
+  Secondly, to address homeowners' concerns that the policy will cause housing prices to plummet, it should be clarified that prices are largely determined by market supply and demand and investor confidence in the market and is not going to change dramatically because of this policy. That being said, many would argue that due to the prolonged trading period, buyers who are eager to buy may increase the bargaining space and long bids and payments from nonprofits and tenants may also deprive sellers of opportunities to buy property elsewhere. That gives rise to another recent amendment that if the lessee fails to expressly indicate to purchase or participate in the price offer within fifteen days, the lessee shall be deemed to have waived the right of preemption. The law can limit the response period of the lessee, which can better balance the rights and obligations of the lessor and the lessee. And to further balance the interests between the lessee and the lessor, I believe future amendments should include requiring the transfer details proposed by the party with the preemptive right to be the same as the transaction between the lessor and any third parties on the market, such as: transaction price, payment method, payment period and so on.
+  Admittedly, due to the shortage of government personnel and the financial budget, this policy may not be able to solve the housing problem. In this case, I believe the existence of non-profit organization is reasonable as it reduces the burden of government workers.Non-profit organization can bring the action to work and can file suit against sellers and agents for non-compliance, the penalty they get can be a source a funding.Anyhow, just as the municipal government said, this policy cannot completely solve the problem of affordable housing, but it is a step to further promote the equality between owner and renter, especially at the difficult time of the epidemic. 
+  To further address affordable housing for EPA tenants. What I think should be supported is creating more housing such as pushing developers to add housing on vacant lots and incentivizing homeowners to develop housing such as converting the house to multi-family. In addition, any program that increases the tax base can provide residents with additional opportunities, such as property taxes, etc. These funds can be provided in the form of grants or loans to facilitate tenant purchases and provide EPA residents with a better quality of life. For house owners, it’s best for them to communicate with tenants well in advance of any property sale, perhaps including terms in every tenancy agreement, so that tenants have time to plan to negotiate prices and market information with landlords when they sell the property.
