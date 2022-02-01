@@ -1,0 +1,1140 @@
+---
+title: Complete Score
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tigris)
+library(censusapi)
+library(mapview)
+library(leaflet)
+library(mapboxapi)
+library(tidytransit)
+library(readxl)
+library(knitr)
+Sys.setenv(CENSUS_KEY="60e044e0b171438ffa284a00c4a369df21caa10e")
+```
+
+
+
+#Menlo Park Isochrones
+
+The sub-geography in the Bay Area that we choose to analyze the complete score is Menlo Park. We analyze a total of three modes of travel, walking, driving and public transportation.
+```{r,eval = F}
+blocks_2020 <- blocks("CA", "San Mateo", year = 2020, progress_bar = F)
+
+mlp_boundary <- places("CA", year=2020, progress_bar = F) %>% 
+  filter(NAME == "Menlo Park")
+
+mlp_blocks <- blocks_2020 %>% 
+  st_centroid() %>% 
+  .[mlp_boundary, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(blocks_2020 %>% select(GEOID20)) %>% 
+  st_as_sf()
+
+mapview(mlp_blocks)
+```
+
+```{r}
+mlp_blocks <- readRDS("mlp_blocks.rds")
+```
+  Walking & Driving
+  
+  Starting from the centroid of each block in the Menlo Park，draw isochrones for walking and driving for 5 minutes, 10 minutes, and 15 minutes, respectively.
+```{r}
+isochrones <- readRDS("mlp_isochrones.rds")
+isochrones %>% mapview()
+```
+  Public transit accessibility
+  
+  The public transit mode assumes walking plus samtrans public transportation.
+Starting from the isochrones within 15-minute walk from centroids of each block of Menlo Park, first filter the stations within the 15-minute walk, and use these stations as the starting point and select an ordinary daytime timetable from the timetable provided by sam trans (2022-4-12 7AM-10PM) to simulate the platforms that can be reached within 15 minutes (including the time to walk to the platform). After arriving at the platform, if there are more than 5 minutes remaining in the total time (15 minutes), then take the arrival station as starting points and draw 5-minute walking isochrones, otherwise draw 1-minute walking isochrones.Add up these isochrones.
+Finally add the driving and walking isochrones.
+
+```{r}
+gtfs <- read_gtfs("https://www.samtrans.com/Assets/GTFS/samtrans/ST-GTFS.zip")
+
+stops <- gtfs$stops %>% 
+  st_as_sf(coords = c("stop_lon","stop_lat"), crs = 4326)
+mapview(stops)
+
+isochrones_walking <- isochrones %>% 
+  filter(mode == "walking") 
+
+stops_walk <- stops %>% 
+  .[isochrones_walking,]
+
+isochrones_firstmile <- isochrones_walking %>% 
+  st_make_valid() %>% 
+  st_join(stops_walk) %>% 
+  st_drop_geometry() %>% 
+  group_by(id) %>% 
+  arrange(time) %>% 
+  filter(!duplicated(stop_id)) %>% 
+  select(
+    firstmile_time = time,
+    id,
+    from_stop_id = stop_id
+  )
+
+stop_times <- filter_stop_times(gtfs, "2022-04-12", 7*3600, 22*3600)
+
+rptr <- raptor(stop_times, gtfs$transfers, isochrones_firstmile$from_stop_id, time_range = 18000,
+               keep = "all")
+
+rptr <- merge(rptr, isochrones_firstmile, by.x = "from_stop_id", by.y = "from_stop_id",allow.cartesian=TRUE)
+
+rptr <- rptr %>% filter(travel_time!=0) 
+rptr$travel_time_incl_walk <- round(rptr$travel_time/60 + rptr$firstmile_time)
+
+rptr<-rptr %>% filter(rptr$travel_time_incl_walk <= 15)
+
+rptr_filter <-rptr %>%filter(!to_stop_id %in% c(rptr$from_stop_id)) %>%group_by(from_stop_id,to_stop_id) %>% 
+  arrange(firstmile_time) %>% filter(!duplicated(to_stop_id)) %>% left_join(stops%>% mutate(to_stop_id=stop_code))
+
+rptr_filter_morethan_5 <- rptr_filter %>% filter(travel_time_incl_walk<10)
+rptr_filter_lessthan_5 <- rptr_filter %>% filter(travel_time_incl_walk>=10)
+```
+
+```{r}
+mapview(rptr_filter$geometry)
+```
+
+```{r,eval = F}
+isochrone1 <- mb_isochrone(
+  rptr_filter_lessthan_5$geometry,
+  profile = "walking",
+  time = c(1)
+)
+isochrone2 <- mb_isochrone(
+  rptr_filter_morethan_5$geometry,
+  profile = "walking",
+  time = c(5)
+)
+
+isochrone_transit <-rbind(isochrone1,isochrone2)%>% 
+  mutate(mode = "transit")%>%rbind(isochrones_walking)
+```
+
+```{r}
+isochrone_transit<- readRDS("isochrone_transit.rds")
+```
+
+```{r}
+mapview(isochrone_transit)
+```
+
+```{r}
+isochrone_total <-rbind(as.data.frame(isochrones),as.data.frame(isochrone_transit))%>%st_as_sf()
+```
+
+```{r}
+mapview(isochrone_total)
+```
+
+
+
+#POI Data
+  
+  Out of 129 POI types, we choose park、doctors、restaurant、school、supermarket to include as amenities we deem important in the completeness score. We picked these to cover diet, education, medical, entertainment aspects of everyday lives.
+Then we filter out the five categories of POIs contained in the isochrone geographic range obtained above.
+```{r}
+pois <-readRDS("pois.rds")
+
+pois_filter <- pois %>% 
+  rename(amenity = fclass) %>% 
+  filter(amenity %in% c(
+    "park",
+    "doctors",
+    "restaurant",
+    "school",
+    "supermarket"
+  ))%>% st_centroid()
+```
+
+```{r}
+pois_filter <- readRDS("pois_filter.rds")
+```
+```{r}
+sf::sf_use_s2(FALSE)
+access_raw <- isochrone_total %>% 
+  st_make_valid() %>%
+  st_join(pois_filter) %>% 
+  filter(!is.na(osm_id)) %>% 
+  st_drop_geometry()
+```
+```{r}
+mapview(pois_filter,zcol = "amenity")
+```
+
+#Subjective Score
+  
+  We model the complete score using the exponential function from the class: each additional amenity of the same POI type adds less value, and the longer the trip takes, the less value.
+
+  Amenity value
+  
+  We give five different types of POI preference scores according to their importance, envision a reasonable number of them, and conduct exponential decay model simulations based on this number.
+```{r}
+amenity_preference <- data.frame(
+  amenity = c("park","doctors","restaurant","school","supermarket"),
+  amenity_value = c(
+    0.6,
+    0.5,
+    0.25,
+    1,
+    0.7
+  ),
+  amenity_quantity = c(
+    2,
+    3,
+    30,
+    1,
+    2
+  )
+) %>% 
+  mutate(
+    amenity_decay = -log(0.5)/amenity_quantity
+  ) 
+```
+```{r echo = FALSE, results = 'asis'}
+kable(amenity_preference, caption = "Amenity Preference")
+```
+
+  Time value
+  
+  Travel time greatly affects the value of an amenity, the shorter the time required, the higher the score. We use NHTS data to obtain the average travel time for the corresponding travel mode (walking and driving to the 5 chosen amenities ), and take the average of the round trip from the same place. Assuming half of the travel time exceeds this average time means that only half of the population is willing to travel this length, we count travel that requires this length of time only half of its original value, and conduct exponential model decay simulations based on this average time.
+  Since there is no public transit data in the NHTS data, we assume that the mode_reasonable time of all types of public transit (the average time/half score time) is 25 minutes.
+  Based on our preference for transportation, we assume that walking is 1 point, driving is 0.6 points, and public transit is only 0.5 points due to the impact of the epidemic.
+
+```{r}
+path = "/Users/guxm/Documents/GitHub/minxue.github.io/nhts17-caltrans-tsdc-download/data/"
+survey_households <- read_csv(paste0(path,"survey_household.csv"))
+
+survey_person <- read_csv(paste0(path,"survey_person.csv"))
+
+survey_trips <- read_csv(paste0(path,"survey_trip.csv"))
+
+weights_person_7day <- read_csv(paste0(path,"survey_person_weights_7day.csv"))
+```
+
+```{r}
+nhts_lookup <- read_excel("/Users/guxm/Documents/GitHub/minxue.github.io/nhts17-caltrans-tsdc-download/documentation/data_elements.xlsx",sheet = "Value Lookup")
+```
+
+```{r}
+person_weights <-
+  survey_person %>% 
+  left_join(
+    weights_person_7day %>% 
+      select(
+        sampno,
+        perno,
+        wttrdfin
+      ),
+    by = c("sampno","perno")
+  )
+```
+
+```{r}
+bay_cities <- places("CA", progress_bar = F) %>% 
+  filter(NAME == "Menlo Park") 
+
+cbsas <- core_based_statistical_areas(cb = T, progress_bar = F)
+
+bay_cbsas <-
+  cbsas %>%
+  .[bay_cities %>% st_centroid(), ]
+```
+
+```{r}
+bay_trips <-
+  survey_trips  %>% 
+  left_join(
+    survey_person,
+    by = c("sampno","perno")
+  ) %>% 
+  left_join(
+    weights_person_7day %>% 
+      select(
+        sampno,
+        perno,
+        wttrdfin
+      ),
+    by = c("sampno","perno")
+  ) %>% 
+  left_join(
+    survey_households %>% select(
+      sampno,
+      hh_cbsa
+    )
+  ) %>% 
+  filter(hh_cbsa %in% bay_cbsas$GEOID)
+```
+
+```{r}
+purpose_lookup <-
+  nhts_lookup %>% 
+  filter(NAME == "WHYTO") %>% 
+  select(VALUE, LABEL) %>% 
+  mutate(
+    VALUE = as.numeric(VALUE),
+    LABEL = factor(LABEL, levels = LABEL)
+  )
+
+mode_lookup <-
+  nhts_lookup %>% 
+  filter(NAME == "TRPTRANS") %>% 
+  select(VALUE, LABEL) %>% 
+  mutate(
+    VALUE = as.numeric(VALUE),
+    LABEL = factor(LABEL, levels = LABEL)
+  )
+
+```
+
+```{r}
+bay_trips_summary_whyto <-
+  bay_trips %>% 
+  left_join(
+    purpose_lookup,
+    by = c("whyto" = "VALUE")
+  ) %>% 
+  rename(purpose_label = LABEL) %>% 
+  left_join(
+    mode_lookup,
+    by = c("trptrans" = "VALUE")
+  ) %>% 
+  rename(mode_label = LABEL)%>% 
+  group_by(
+    purpose_label,
+    mode_label
+  ) %>% 
+  summarize(
+    median_time = median(trvlcmin)
+  )
+
+bay_trips_summary_whyfrom <-
+  bay_trips %>% 
+  left_join(
+    purpose_lookup,
+    by = c("whyfrom" = "VALUE")
+  ) %>% 
+  rename(purpose_label = LABEL) %>% 
+  left_join(
+    mode_lookup,
+    by = c("trptrans" = "VALUE")
+  ) %>% 
+  rename(mode_label = LABEL)%>% 
+  group_by(
+    purpose_label,
+    mode_label
+  ) %>% 
+  summarize(
+    median_time = median(trvlcmin)
+  )
+```
+
+
+```{r}
+bay_trips_summary <-rbind(
+    bay_trips_summary_whyto,
+    bay_trips_summary_whyfrom
+  ) %>% 
+  group_by(purpose_label, mode_label) %>% 
+  summarize(
+    trip_time = mean(median_time, na.rm = T)
+  ) 
+
+bay_trips_summary <-bay_trips_summary%>% filter(mode_label == "Walk" | mode_label == "Car")
+
+bay_trips_summary_mutate <-rbind(bay_trips_summary[18:19,],bay_trips_summary[23:24,],bay_trips_summary[27:28,],bay_trips_summary[31:32,],bay_trips_summary[37:38,])%>% mutate(mode = case_when(
+        mode_label == "Car" ~ "driving",
+        mode_label == "Walk" ~ "walking")
+)%>%mutate(amenity = case_when(
+        purpose_label == "8. Attend school as a student" ~ "school",
+        purpose_label == "11. Buy goods (groceries, clothes, appliances, gas)" ~ "supermarket",
+        purpose_label == "13. Buy meals (go out for a meal, snack, carry-out)" ~ "restaurant",
+        purpose_label == "15. Recreational activities (visit parks, movies, bars, museums)" ~ "park",
+        purpose_label == "18. Health care visit (medical, dental, therapy)" ~ "doctors")
+)%>%mutate(mode_reasonable = trip_time)%>%select(mode_reasonable,mode,amenity)
+
+bay_trips_summary_mutate$mode_value = c(1,0.6,1,0.6,1,0.6,1,0.6,1,0.6)
+
+bay_trips_summary_mutate <-bay_trips_summary_mutate%>% 
+  mutate(
+    mode_decay = -log(0.5)/mode_reasonable
+  )
+
+transit_score <- data.frame(
+  mode = c("transit"),
+  mode_value = c(
+    0.5
+  ),
+ mode_reasonable = c(
+    25
+  ),
+ amenity = c("school","restaurant","doctors","park","supermarket"),purpose_label = c("school","restaurant","doctors","park","supermarket")) %>% 
+  mutate(
+    mode_decay = -log(0.5)/mode_reasonable
+  )
+mode_preference <- rbind(transit_score,bay_trips_summary_mutate)
+```
+
+```{r echo = FALSE, results = 'asis'}
+kable(mode_preference, caption = "Mode Preference")
+```
+  After setting up the scoring model, we set up a base score where we assume all amenities' POIs are on their own mode_reasonable boundaries (half score).
+  Then we remove the duplicates in the stacked POIs in the isochrones and apply the decay model to each POI to get a mode score(neglecting the weight of mode_value) and a total score(counting the weight of mode_value). Finally, we group and sum them up in the units of blocks and get a complete block score.
+```{r}
+function_get_final_score <- function(pois) {
+  
+  sf::sf_use_s2(FALSE)
+  access_raw <- isochrone_total %>% 
+    st_make_valid() %>%
+    st_join(pois) %>% 
+    filter(!is.na(osm_id)) %>% 
+    st_drop_geometry()
+  
+  complete_temp <- access_raw %>% 
+  left_join(
+    amenity_preference,
+    by = "amenity"
+  ) %>% 
+  left_join(
+    mode_preference,
+    by = c("mode","amenity")
+  ) %>% group_by(id,mode,amenity) %>% 
+  arrange(time) %>% 
+  mutate(
+    amenity_rank = row_number() - 1
+  ) %>% 
+  ungroup()
+  
+  complete_baseline <- data.frame(
+    amenity = amenity_preference$amenity %>% 
+      rep(amenity_preference$amenity_quantity)
+  ) %>% 
+    left_join(
+      amenity_preference,
+      by = "amenity"
+    ) %>% 
+    group_by(amenity) %>% 
+    mutate(
+      amenity_rank = row_number() - 1
+    ) %>% 
+    ungroup() %>% 
+    mutate(
+      score = amenity_value * exp(-amenity_rank * amenity_decay) * 0.5
+    )
+  
+  complete_modes <- complete_temp %>% 
+    mutate(
+      score = amenity_value * exp(-amenity_rank * amenity_decay) * exp(-time * mode_decay)
+    ) %>% 
+    group_by(id, mode) %>% 
+    arrange(desc(score)) %>% 
+    filter(!duplicated(osm_id)) %>%
+    summarize(
+      score = sum(score, na.rm=T)/sum(complete_baseline$score)
+    )
+  
+  complete_total <- complete_temp %>% 
+    mutate(
+      score = amenity_value * exp(-amenity_rank * amenity_decay) * mode_value * exp(-time * mode_decay)
+    ) %>% 
+    group_by(id) %>% 
+    arrange(desc(score)) %>% 
+    filter(!duplicated(osm_id)) %>% 
+    summarize(
+      score = sum(score, na.rm = T)/sum(complete_baseline$score)
+    ) %>% 
+    mutate(mode = "total")
+  
+  complete <- rbind(
+    complete_modes,
+    complete_total
+  )
+  
+  complete_map <- complete %>% 
+    pivot_wider(
+      names_from = "mode",
+      values_from = "score"
+    ) %>% cbind(mlp_blocks%>% select(GEOID20))%>%st_as_sf()
+
+  return(complete_map)
+}
+```
+
+
+```{r}
+current_score<-function_get_final_score(pois_filter)
+```
+
+
+```{r}
+mapview(current_score,zcol = "total")
+```
+
+#Parallel Analysis
+
+1.critical amenity analysis
+
+  Among the selected 5 amenities, we take supermarkets as the most important critical amenities and analyze their traffic accessibility. We start from the center of each block of Menlo park. If a supermarket is in the block's 15-minute walking isochrone, then it is determined that the block has supermarket reachability, otherwise it does not.
+```{r}
+pois_filter_critical <- pois_filter %>% 
+  filter(amenity %in% c(
+    "supermarket"
+  ))
+mapview(pois_filter_critical)
+```
+```{r}
+access_raw_critical <- isochrones %>% 
+  filter(mode == "walking") %>%
+  filter(time == 15)%>%
+  st_make_valid() %>% 
+  st_join(pois_filter_critical) %>% 
+  st_drop_geometry() %>% 
+  filter(!is.na(osm_id))
+```
+
+```{r}
+blocks_critical_amenity_access <-
+  isochrones %>%
+  mutate(
+    critical_amenity_access = 
+      ifelse(
+        id %in% access_raw_critical$id,
+        "yes",
+        "no"
+      )
+  )  %>%
+  filter(mode == "walking") %>%
+  filter(time == 15)
+
+blocks_access <-
+  blocks_critical_amenity_access%>% 
+  cbind(mlp_blocks%>% select(GEOID20))%>%st_drop_geometry() %>%st_as_sf()
+
+mapview(blocks_access,zcol = "critical_amenity_access")
+```
+
+```{r}
+sum(blocks_access$critical_amenity_access=="no")/ nrow(blocks_access)
+```
+As can be seen from the picture, less than half of the blocks in Menlo park have supermarkets within 15 minutes' walk. And these are concentrated in the middle of Menlo Park, which means that people in the rest of the area have to rely on cars or other transportation to get to the supermarket and public transport in these areas should be enhanced to compensate for the disadvantaged position of people without cars.
+
+
+2.negative amenity
+
+After checking 129 types of amenities, we decided to choose `fast_food` as a negative utility.
+We propose a quadratic subjective scoring model in the amenity value.
+Suppose the negative impact of the 0st negative POI is only 1 and at this time, assume the negative impact of the 10th negative POI reaches to 2. That is to say:
+$$ Negative\ Impact\ of\ Fast\ Food = 0.01 \times (quantity\ of\ fast\ food) ^2  + 1 $$
+
+We use the same time exponential function from the class: the longer the trip takes, the less negative impact,the less negative value.
+```{r}
+pois_filter_negative <- pois %>% 
+  rename(amenity = fclass) %>% 
+  filter(amenity %in% c(
+    "fast_food"
+  ))
+
+saveRDS(pois_filter_negative, "pois_filter_n.rds")
+pois_filter_negative <- readRDS("pois_filter_n.rds")
+```
+
+
+```{r}
+access_raw_n <- isochrones %>% 
+  st_make_valid() %>%
+  st_join(pois_filter_negative) %>% 
+  filter(!is.na(osm_id)) %>% 
+  st_drop_geometry()
+```
+
+
+```{r}
+amenity_negativity <- data.frame(
+  amenity = c(
+    "fast_food"
+  ),
+  amenity_value = c(
+    -0.1
+  ),
+  amenity_quantity = c(
+    10
+  ),
+  amenity_increase = c(
+      0.01
+    )
+)
+
+mode_negativity <- data.frame(
+  mode = c(
+    "walking",
+    "driving"
+  ),
+  mode_value = c(
+    1,
+    0.6
+  ),
+  mode_reasonable = c(
+    20,
+    30
+  )
+) %>% 
+  mutate(
+    mode_decay = -log(0.5)/mode_reasonable
+  )
+```
+
+```{r echo = FALSE, results = 'asis'}
+kable(amenity_negativity, caption = "Amenity Negative Impact")
+```
+```{r echo = FALSE, results = 'asis'}
+kable(mode_negativity, caption = "Mode Preference")
+```
+
+
+```{r}
+negative_baseline <- data.frame(
+  amenity = amenity_negativity$amenity %>% 
+    rep(amenity_negativity$amenity_quantity)
+) %>% 
+  left_join(
+    amenity_negativity,
+    by = "amenity"
+  ) %>% 
+  group_by(amenity) %>% 
+  mutate(
+    amenity_rank = row_number()-1
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    score =  amenity_value * (amenity_increase * amenity_rank * amenity_rank + 1) * 0.5
+  ) 
+
+sum(negative_baseline$score)
+```
+
+```{r}
+negative_temp <- access_raw_n %>% 
+  left_join(
+    amenity_negativity,
+    by = "amenity"
+  ) %>% 
+ left_join(
+    mode_negativity,
+    by = "mode"
+  ) %>% 
+  group_by(id, mode, amenity) %>% 
+  arrange(time) %>% 
+  mutate(
+    amenity_rank = row_number() - 1
+  ) %>% 
+  ungroup()
+
+negative_modes <- negative_temp %>% 
+  mutate(
+    score = (amenity_increase * amenity_rank * amenity_rank + 1) * amenity_value * exp(-time * mode_decay)
+  ) %>% 
+  group_by(id, mode) %>% 
+  arrange(desc(score)) %>% 
+  filter(!duplicated(osm_id)) %>% 
+  summarize(
+    score = sum(score, na.rm=T) / sum(negative_baseline$score)
+  )
+
+negative_total <-negative_temp %>% 
+   mutate(
+    score = (amenity_increase * amenity_rank * amenity_rank + 1) * amenity_value * mode_value * exp(-time * mode_decay)
+  ) %>%  
+  group_by(id) %>% 
+  arrange(desc(score)) %>% 
+  filter(!duplicated(osm_id)) %>% 
+  summarize(
+    score = sum(score, na.rm = T) / abs(sum(negative_baseline$score))
+  ) %>% 
+  mutate(mode="total")
+
+negative_map <- negative_total %>% 
+  pivot_wider(
+    names_from = "mode",
+    values_from = "score"
+  ) %>% 
+  cbind(mlp_blocks %>% select(GEOID20)) %>% 
+  st_as_sf()
+
+mapview(negative_map, zcol = 'total')
+```
+Finally, we can get the negative utility score because of fast food and shelter in each blocks of  Menlo Park. Since almost all the score are higher than baseline, relative score is used for mapping. From the mapping we can see that in the middle area of Menlo Park City, the negative utility caused by fast food and shelter is serious. Especially for the following 5 blocks, their negative utility scores are too high, which should be paied attentioned to.   
+$$Relative\ Score =  1 - \frac{Score\ - min(Score)}{max(Score)\ - min(Score)}$$
+
+```{r echo = FALSE, results = 'asis'}
+kable(negative_map %>% 
+  arrange(desc(total)) %>% 
+  st_drop_geometry()%>% .[1:5,], caption = "Five Blocks with Highest Negative Utility Score ")
+```
+
+#Final Analysis
+
+1.equity analysis
+
+  In order to observe the data more intuitively, we divided the scores of each block into three categories. Scores below 1.2 are considered poor performance, 1.2 to 1.7 are average, and scores above 1.7 are considered good performance. At the same time, we use population data to determine the racial population distribution of each block and whether there is inequality in terms of community scores.
+```{r,eval=FALSE}
+dec_vars_2020 <-
+  listCensusMetadata(
+    name = "2020/dec/pl",
+    type = "variables"
+  )
+
+smc_pop_race_2020 <-
+  getCensus(
+    name = "dec/pl",
+    vintage = 2020,
+    region = "block:*", 
+    regionin = "state:06+county:081",
+    vars = "group(P1)"
+  ) %>% 
+  mutate(
+    block =
+      paste0(state,county,tract,block)
+  ) %>% 
+  select(!c(GEO_ID,state,county,tract,NAME) & !ends_with(c("NA"))) %>% 
+  pivot_longer(
+    ends_with("N"),
+    names_to = "name",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    dec_vars_2020 %>% 
+      select(name, label)
+  ) %>% 
+  select(-name) %>% 
+  separate(
+    label,
+    into = c(NA,NA,"category1","category2"),
+    sep = "!!"
+  )
+```
+
+```{r}
+smc_pop_race_2020 <-readRDS("smc_pop_race_2020.rds")
+```
+
+```{r}
+smc_pop_race_2020 <- smc_pop_race_2020 %>% 
+  mutate(
+    race = case_when(
+      category1 == "Population of two or more races:" & is.na(category2) ~ "Two or more races",
+      category1 == "Population of two or more races:" ~ "",
+      !is.na(category2) ~ category2,
+      TRUE ~ ""
+    )
+  )
+
+smc_pop_race_2020 <- smc_pop_race_2020 %>% 
+  filter(race != "") %>% 
+  select(block, race, pop = estimate)
+
+current_score<- current_score %>% 
+  mutate(
+    complete_score_tier =
+      case_when(
+        total < 1.2 ~ "Poor",
+        total < 1.7 ~ "Acceptable",
+        total < 2.2 ~ "Good",
+        TRUE ~ "Good"
+      ) 
+  )
+```
+
+From the map, most areas in Menlo park are of average score, with higher scores near Palo Alto and lower scores in the northernmost and southernmost parts of Menlo Park, which means that the necessary living amenities in these places are below average and attention need to be focused on these areas.
+```{r}
+mapview(current_score,zcol = "complete_score_tier")
+```
+
+
+
+```{r}
+mlp_pop_race_2020 <-
+  smc_pop_race_2020%>%
+  filter(block %in% mlp_blocks$GEOID20)
+
+mlp_pop_race <-
+  mlp_pop_race_2020 %>% 
+  mutate(race = factor(race, levels = unique(mlp_pop_race_2020$race))) %>% 
+  group_by(race) %>% 
+  summarize(pop = sum(pop)) %>% 
+  mutate(
+    perc = pop/sum(pop),
+    group = "Full Population"
+  )
+```
+
+```{r}
+mlp_pop_race_2020_grade<- mlp_pop_race_2020 %>%left_join(current_score%>% 
+      st_drop_geometry(),by = c("block"= "GEOID20"), na.rm = T)
+```
+
+
+```{r}
+mlp_pop_race_2020_grade_fill <-
+  mlp_pop_race_2020_grade %>% 
+  group_by(complete_score_tier, race) %>% 
+  summarize(pop = sum(pop)) %>% 
+  rbind(
+    mlp_pop_race %>% 
+      group_by(race) %>% 
+      summarize(pop = sum(pop)) %>% 
+      mutate(complete_score_tier = "Total")
+  )%>% 
+  ggplot() +
+  geom_bar(
+    aes(
+      x = complete_score_tier %>% factor(levels = rev(c("Total","Poor","Acceptable","Good"))),
+      y = pop,
+      fill = race 
+    ),
+    stat = "identity",
+    position = "fill"
+  ) +
+  labs(
+    x = "Complete Score",
+    y = "Number of households",
+    title = "Menlo Park comple score by race",
+    fill = "Race of householder"
+  ) +
+  coord_flip() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "vertical"
+  ) +
+  guides(
+    fill = guide_legend(
+      reverse = T
+    )
+  )
+```
+
+
+
+```{r}
+mlp_pop_race_2020_grade_fill
+```
+
+  From the table, the white population seems to be evenly distributed across areas with different complete score, but Asians are more likely to live in areas with lower complete scores, which means they may be less convenient to reach important facilities where they live.
+
+2.2019 VS 2022
+
+In order to increase the reproducibility of the complete score method, our group created a complete score function and used it for the comparison of Menlo Park complete score from 2019 to 2022
+Due to the confusion of Geoid of blocks in 2019-2022, here we use isochrones that only include walking and driving modes.
+```{r}
+
+function_get_final_score <- function(pois_filter, geo_id, amenity_type, mode_preference, isochrones, blocks) {
+    sf::sf_use_s2(FALSE)
+    access_raw <- isochrones %>% 
+      st_make_valid() %>%
+      st_join(pois_filter) %>% 
+      filter(!is.na(osm_id)) %>% 
+      st_drop_geometry()
+
+  
+  complete_temp <- access_raw %>% 
+    left_join(
+      amenity_type,
+      by = "amenity"
+    ) %>% 
+    left_join(
+      mode_preference,
+      by = c("mode","amenity")
+      # by = "mode"
+    ) %>% group_by(id,mode,amenity) %>% 
+    arrange(time) %>% 
+    mutate(
+      amenity_rank = row_number() - 1
+    ) %>% 
+    ungroup()
+  
+  complete_baseline <- data.frame(
+    amenity = amenity_type$amenity %>% 
+      rep(amenity_type$amenity_quantity)
+  ) %>% 
+    left_join(
+      amenity_type,
+      by = "amenity"
+    ) %>% 
+    group_by(amenity) %>% 
+    mutate(
+      amenity_rank = row_number() - 1
+    ) %>% 
+    ungroup() %>% 
+    mutate(
+      score = amenity_value * exp(-amenity_rank * amenity_decay) * 0.5
+    )
+
+  complete_modes <- complete_temp %>% 
+    mutate(
+      score = amenity_value * exp(-amenity_rank * amenity_decay) * exp(-time * mode_decay)
+    ) %>% 
+    group_by(id, mode) %>% 
+    arrange(desc(score)) %>% 
+    filter(!duplicated(osm_id)) %>%
+    summarize(
+      score = sum(score, na.rm=T)/sum(complete_baseline$score)
+    )
+
+  
+  complete_total <- complete_temp %>% 
+    mutate(
+      score = amenity_value * exp(-amenity_rank * amenity_decay) * mode_value * exp(-time * mode_decay)
+    ) %>% 
+    group_by(id) %>% 
+    arrange(desc(score)) %>% 
+    filter(!duplicated(osm_id)) %>% 
+    summarize(
+      score = sum(score, na.rm = T)/sum(complete_baseline$score)
+    ) %>% 
+    mutate(mode = "total")
+
+  complete <- rbind(
+    complete_modes,
+    complete_total)
+  
+  complete_map <- complete %>% 
+    pivot_wider(
+      names_from = "mode",
+      values_from = "score"
+    ) %>% cbind(blocks%>% select(geo_id))%>%st_as_sf()
+  
+  return(complete_map)
+}
+```
+
+
+
+
+```{r}
+# 2019 - 2022 Menlo Park Blocks Complete Scores
+amenity_list <- c(    
+  "park",
+  "doctors",
+  "restaurant",
+  "school",
+  "supermarket")
+
+# 2019
+mlp_blocks_19 <- readRDS("mlp_cbs_2019.rds")
+isochrones <- readRDS("mlp_isochrones_2019.rds")
+isochron_total_2019 <-rbind(as.data.frame(isochrones),as.data.frame(isochrone_transit))%>%st_as_sf()
+pois <- st_read("/Users/guxm/Documents/GitHub/minxue.github.io/norcal-190101-free.shp/gis_osm_pois_a_free_1.shp")
+pois_filter <-
+  pois %>%
+  mutate(amenity = fclass)%>%
+  select(-fclass) %>% 
+  filter(amenity %in% amenity_list)
+score_2019<-function_get_final_score(pois_filter, "GEOID10", amenity_preference,mode_preference, isochrones, mlp_blocks_19)
+
+
+# 2020
+mlp_blocks <- readRDS("mlp_blocks.rds")
+isochrones <- readRDS("isochrone_total.rds")
+
+pois <- st_read("/Users/guxm/Documents/GitHub/minxue.github.io/norcal-200101-free.shp/gis_osm_pois_a_free_1.shp")
+pois_filter <-
+  pois %>%
+  mutate(amenity = fclass)%>%
+  select(-fclass) %>% 
+  filter(amenity %in% amenity_list)
+score_2020<-function_get_final_score(pois_filter, "GEOID20", amenity_preference,mode_preference, isochrones, mlp_blocks)
+
+# 2021
+mlp_blocks <- readRDS("mlp_blocks.rds")
+isochrones <- readRDS("isochrone_total.rds")
+pois <- st_read("/Users/guxm/Documents/GitHub/minxue.github.io/norcal-210101-free.shp/gis_osm_pois_a_free_1.shp")
+pois_filter <-
+  pois %>%
+  mutate(amenity = fclass)%>%
+  select(-fclass) %>% 
+  filter(amenity %in% amenity_list)
+score_2021<-function_get_final_score(pois_filter, "GEOID20", amenity_preference,mode_preference, isochrones, mlp_blocks)
+
+
+# 2022
+mlp_blocks <- readRDS("mlp_blocks.rds")
+isochrones <- readRDS("isochrone_total.rds")
+pois <- st_read("/Users/guxm/Documents/GitHub/minxue.github.io/norcal-190101-free.shp/gis_osm_pois_a_free_1.shp")
+pois_filter <-
+  pois %>%
+  mutate(amenity = fclass)%>%
+  select(-fclass) %>% 
+  filter(amenity %in% amenity_list)
+score_2022<-function_get_final_score(pois_filter, "GEOID20", amenity_preference,mode_preference, isochrones, mlp_blocks)
+
+# mapview(score_2022,zcol = "total")
+
+```
+
+The following chart shows the summary of complete scores of each blocks in the city decreased year by year. From 2019 to 2020, the decline is very obvious since the number of blocks increased from 2019 to 2020. In generally, new amenities are becoming more and more concentrated in some areas. In this case, the complete score will not increase obviously even decrease since the exponential decay will decay slowly with the increase of amenities.
+
+```{r}
+summary_19_22 <- data.frame(
+  year = c(
+    '2019',
+    '2020',
+    '2021',
+    '2022'
+  ),
+  sum_score = c(
+    sum(score_2019$total),
+    sum(score_2020$total),
+    sum(score_2021$total),
+    sum(score_2022$total)
+  ),
+  count_more_than1 = c(
+    nrow(score_2019 %>% filter(total>=1)),
+    nrow(score_2020 %>% filter(total>=1)),
+    nrow(score_2021 %>% filter(total>=1)),
+    nrow(score_2022 %>% filter(total>=1))
+  ))
+
+ggplot(summary_19_22, aes(x=year, y=sum_score, group =1)) +  geom_line(colour = "red") +
+  labs(x="Year") + 
+  labs(y="The summary of complete scores of each blocks")
+# plot(summary_19_22$year, summary_19_22$sum_score)
+```
+
+The following mapping shows the complete scores of each blocks in Menlo Park City from 2019 to 2022. From the mapping, we can see that the blocks in the center area of the city have the greatest complete scores and during the four years, their scores increased more quickly than other blocks'. From the view of urban development planner, the blocks of other area should also be considered when some new amenities are built. 
+
+```{r}
+pal <- colorNumeric(
+  palette = "Reds",
+  domain = score_2019$total 
+)
+
+leaflet() %>% 
+  addMapboxTiles(
+    style_id = "streets-v11",
+    username = "mapbox"
+  )  %>% 
+  addPolygons(
+    data = score_2019,
+    fillColor = ~pal(total),
+    label = ~paste0(GEOID10,':', round(total,3)),
+    fillOpacity = 0,
+    color = "purple",
+    weight = .5,
+    highlightOptions = highlightOptions(
+      weight = 2
+    ),
+    group = 'Maten Park Blocks'
+  ) %>% 
+  addPolygons(
+    data = score_2019,
+    fillColor = ~pal(total),
+    label = ~paste0(GEOID10,':', round(total,3)),
+    fillOpacity = 0.5,
+    color = "purple",
+    weight = .5,
+    highlightOptions = highlightOptions(
+      weight = 2
+    ),
+    group = '2019'
+  )    %>% 
+  addPolygons(
+    data = score_2020,
+    fillColor = ~pal(total),
+    label = ~paste0(GEOID20,':', round(total,3)),
+    fillOpacity = 1,
+    color = "purple",
+    weight = .5,
+    highlightOptions = highlightOptions(
+      weight = 2
+    ),
+    group = '2020'
+  )     %>% 
+  addPolygons(
+    data = score_2021,
+    fillColor = ~pal(total),
+    label = ~paste0(GEOID20,':', round(total,3)),
+    fillOpacity = 1,
+    color = "purple",
+    weight = .5,
+    highlightOptions = highlightOptions(
+      weight = 2
+    ),
+    group = '2021'
+  )  %>% 
+  addPolygons(
+    data = score_2022,
+    fillColor = ~pal(total),
+    label = ~paste0(GEOID20,':', round(total,3)),
+    fillOpacity = 1,
+    color = "purple",
+    weight = .5,
+    highlightOptions = highlightOptions(
+      weight = 2
+    ),
+    group = '2022'
+  ) %>%
+  addLayersControl(
+    baseGroups = "Maten Park Blocks",
+    overlayGroups = c("2019", "2020", "2021", "2022"),
+    options = layersControlOptions(collapsed = FALSE))
+```
+
+
+3.Hypothetical demonstration
+
+Due to the low score of east palo alto, in order to meet the needs of people's livelihood, a small comprehensive shopping mall is assumed to be built near East Palo Alto, which includes three new restaurants and a new supermarket.
+
+```{r}
+
+index <- 1:3
+new_pois <- NULL
+
+for (idx in index){
+    temp <- data.frame(osm_id = idx,code = idx,amenity = "reataurant",name = paste0("restaurant",idx), Latitude = 37.474750,Longitude = -122.155764)%>%
+  st_as_sf(coords = c("Longitude","Latitude"), crs = 4326)
+    new_pois <- rbind(new_pois,temp)
+}
+
+
+new_supermarket <- 
+  data.frame(osm_id = "00000004",code = "0004",amenity = "supermarket",name = paste0("supermarket"), Latitude = 37.474750,Longitude = -122.155764)%>%
+  st_as_sf(coords = c("Longitude","Latitude"), crs = 4326)
+  
+new_pois <- rbind(new_pois,new_supermarket)
+
+    
+mlp_pois_filter_new <-
+  pois_filter%>%
+  rbind(new_pois)
+```
+
+```{r}
+new_score<-function_get_final_score(mlp_pois_filter_new,"GEOID20",amenity_preference,mode_preference, isochrone_total,mlp_blocks)
+
+mapview(new_score,zcol = "total")
+```
+
+It can be seen that compared with the previous score, the complete score near East Plao Alto has increased. For example, the score of id 116 block has increased significantly, which is the same as expected.
+```{r}
+compare<- rbind(new_score %>%filter(id == "116"),
+current_score %>%filter(id == "116")%>%select(-complete_score_tier))%>%mutate(stutus =c("new","current") )%>%select(-geometry)
+```
+
+```{r echo = FALSE, results = 'asis'}
+kable(compare, caption = "Comparison (060816118001009 as example)")
+```
+
+
+The complete score is a good idea. It links the actual traffic model and traffic travel situation with the land POI, and through certain mathematical model calculations, it reflects the overall convenience of residents in a region and the integrity of the community. The disadvantage is that the amenity score is based on the scorer's own subjective feelings, which may not represent the real needs of block residents, and the score is in the form of the sum of multiple types of POIs, so it can only roughly reflect the convenience of public facilities and transportation in a region, not specifically about what facilities are missing, although using the critical amenity score can make up for it to some extent.
