@@ -1,0 +1,1190 @@
+---
+title: "GHG Emission"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tigris)
+library(censusapi)
+library(mapview)
+library(leaflet)
+library(mapboxapi)
+library(tidytransit)
+library(readxl)
+library(knitr)
+Sys.setenv(CENSUS_KEY="60e044e0b171438ffa284a00c4a369df21caa10e")
+```
+Greenhouse gases, which trap heat and warm the planet, originate from a range of human activities.
+Our group performed an analysis of GHG emissions in a particular area of the Bay Area. The scope of the analysis is to estimate GHG emissions in a city (Redwood City), represented by three ZIP codes(94061,94063,94065).
+
+# 1
+Transportation is a great contributor to greenhouse gas emissions, so we analyzed commuter vehicle emissions in Redwood City. We took our data from the home block group and work block group route pairs in the (LODES) data, and calculate the distance and time for each trip using MapBox function. Finally, total GHG emissions are calculated from the travel mode in ACS combined with emfac emission factor.
+```{r}
+bay_cbgs <- block_groups("CA", cb = T, progress_bar = F)
+
+
+zctas <-readRDS("zctas.rds")
+rwc_boundary <- places("CA", progress_bar = F) %>% 
+  filter(NAME == "Redwood City")
+
+zip <- zctas  %>% 
+  st_centroid() %>% 
+  .[rwc_boundary, ] %>% 
+  st_drop_geometry() %>% 
+  left_join(zctas %>% select(GEOID10)) %>% 
+  st_as_sf()
+```
+When acquiring a redwood city work-family block pair, to avoid the problem of routing duplication between zip codes within the city, our outbound is defined as beyond the city boundaries (the combined area of three zip codes). Trips to Redwood City may come from all over the country and we will be focusing on work car commute emissions so we will only get California blocks. Due to the small granularity of the block area, the carbon footprint brought by the traffic within the same block can be ignored. To simplify the model, we leave them out.
+```{r,eval=FALSE}
+blocks <- blocks("CA")
+zip_blocks <- 1:nrow(zip) %>% 
+  map_dfr(function(i){
+    blocks %>%
+      st_centroid() %>%
+      .[zip[i,], ] %>% 
+      mutate(
+        zipcode = zip[i,]$ZCTA5CE10
+      )
+})
+
+
+zip_blocks <- zip_blocks %>% 
+  mutate(cbg = GEOID10 %>% substr(1,12))
+
+```
+
+```{r}
+zip_blocks <- read_rds("zip_blocks.rds")
+```
+
+
+```{r,eval=F}
+full_zip_od <- 2013:2019 %>% 
+  map_dfr(function(year){
+    
+    print(year)
+    
+    temp <- read_csv(paste0("/Volumes/GoogleDrive-110193744224122693685/Shared drives/SFBI/Data Library/LODES/ca_od_main_JT01_", year, ".csv.gz")) %>% 
+      filter(
+        h_geocode %in% zip_blocks$GEOID10 |
+          w_geocode %in% zip_blocks$GEOID10
+      ) %>% 
+      mutate(year = year)
+    
+    saveRDS(temp, paste0("temp_od_", year, ".rds"))
+    
+    return(temp)
+    
+  })
+```
+
+```{r}
+full_zip_od <- read_rds('full_zip_od.rds')
+```
+
+```{r,eval=F}
+full_zip_od_clean <- full_zip_od %>% 
+  select(-createdate) %>% 
+  filter(!(
+    h_geocode %in% zip_blocks$GEOID10 &
+      w_geocode %in% zip_blocks$GEOID10
+  )) %>% 
+  mutate(
+    direction = ifelse(
+      h_geocode %in% zip_blocks$GEOID10,
+      "outbound",
+      "inbound"
+    )
+  )
+```
+
+```{r}
+full_zip_od_clean <- readRDS("full_zip_od_clean.rds")
+```
+
+```{r,eval=FALSE}
+full_zip_od_routing <- full_zip_od_clean %>% 
+  mutate(
+    origin = ifelse(
+      direction == "inbound",
+      h_geocode,
+      w_geocode
+    ),
+    destination = ifelse(
+      direction == "outbound",
+      h_geocode,
+      w_geocode
+    ),
+    cbg = origin %>% substr(1,12),
+    tract = origin %>% substr(1,11)
+  )%>%
+  filter(!duplicated(cbg)) %>% 
+  left_join(zip_blocks %>%
+              select(GEOID10,zipcode)%>%
+              st_drop_geometry(), by = c ("destination" = "GEOID10"))
+
+```
+
+```{r}
+full_zip_od_routing <- readRDS("full_zip_od_routing.rds")
+```
+
+```{r}
+ca_cbgs <- block_groups("CA", cb = T, progress_bar = F)
+
+zip_od_origin <-
+  full_zip_od_routing %>% 
+  select(cbg) %>% 
+  left_join(ca_cbgs %>% select(cbg = GEOID)) %>% 
+  st_as_sf() %>% 
+  st_centroid() %>% 
+  st_coordinates()
+
+
+
+zip_od_destination <-
+  full_zip_od_routing %>% 
+  select(zipcode) %>% 
+  left_join(zip, by = c("zipcode" = "GEOID10")) %>%  
+  st_as_sf()%>% 
+  st_centroid() %>% 
+  st_coordinates()
+
+```
+
+It can be seen that of the 23,196 block areas in CA, about 80% of the areas are connected to Redwood city in terms of work travel.
+```{r}
+18565/23196
+```
+
+```{r,eval=FALSE}
+zip_od_route <- 
+  1:ceiling(nrow(zip_od_origin)/1000) %>% 
+  map_dfr(function(y){
+    
+    print(y)
+    
+    temp <- (y * 1000 - 999) : pmin(y * 1000, nrow(zip_od_origin)) %>% 
+      map_dfr(function(x){
+        tryCatch(
+          mb_directions(
+            origin = zip_od_origin[x, ],
+            destination = zip_od_destination[x, ],
+            profile = "driving-traffic"
+          ) %>% 
+            mutate(id = x),
+          error = function(e){
+            data.frame(id = x)
+          }
+        )
+      }) %>% 
+      st_as_sf()
+      
+      saveRDS(temp, paste0("temp",y,".rds"))
+      
+      return(temp)
+    
+  })
+```
+
+```{r}
+zip_od_route <- readRDS("zip_od_route.rds")
+```
+
+```{r}
+leaflet() %>%
+  addMapboxTiles(
+    style_id = "light-v9",
+    username = "mapbox"
+  ) %>%
+  addPolylines(
+    data = zip_od_route 
+  )
+```
+We assume a total of 261 working days in a calendar year.This means that each work-home pair is repeated 261 times when calculating total emissions.
+```{r}
+full_zip_od_routed <- full_zip_od_routing %>% 
+  cbind(zip_od_route)
+
+full_zip_od_final <- full_zip_od_clean %>% 
+  mutate(
+    origin = ifelse(
+      direction == "inbound",
+      h_geocode,
+      w_geocode
+    ),
+    cbg = substr(origin, 1, 12)
+  ) %>% 
+  left_join(
+    full_zip_od_routed %>% 
+      select(cbg, duration, distance, zipcode)
+  ) %>% 
+  mutate(
+    visits = S000 * 261
+  )
+```
+We use ACS data to draw the ratio of single passenger cars to carpool commutes and applied this ratio on LODES data to estimate the total number of vehicle trips and visits.
+```{r,eval=FALSE}
+acs_vars_2019_5yr <-
+  listCensusMetadata(
+    name = "2019/acs/acs5",
+    type = "variables"
+  )
+
+ travel_time_mode <-
+  counties("CA", cb = T, progress_bar = F) %>%
+  pull(COUNTYFP) %>% 
+  map_dfr(function(x){
+    getCensus(
+      name = "acs/acs5",
+      vintage = 2019,
+      region = "block group:*",
+      regionin = paste0("state:06+county:", x),
+      vars = "group(B08134)"
+    )
+  }) %>% 
+  mutate(
+    cbg =
+      paste0(state,county,tract,block_group)
+  ) %>%
+  filter(cbg %in% full_zip_od_final$cbg) %>% 
+  select(!c(GEO_ID,state,county,tract,block_group,NAME) & !ends_with(c("EA","MA","M"))) %>%
+  pivot_longer(
+    ends_with("E"),
+    names_to = "variable",
+    values_to = "estimate"
+  ) %>%
+  left_join(
+    acs_vars_2019_5yr %>% 
+      select(name, label), 
+    by = c("variable" = "name")
+  ) %>% 
+  select(-variable) %>% 
+  separate(
+    label,
+    into = c(NA, NA, "total", "mode", "carpool", "time"),
+    sep = "!!"
+  )
+```
+
+```{r}
+travel_time_mode <- readRDS("/Users/guxm/Documents/GitHub/minxue.github.io/ travel_time_mode.rds")
+```
+
+```{r}
+travel_time_mode<- travel_time_mode %>% 
+  mutate(
+    mode = case_when(
+      total %in% c(
+        "Less than 10 minutes",
+        "10 to 14 minutes",
+        "15 to 19 minutes",
+        "20 to 24 minutes",
+        "25 to 29 minutes",
+        "30 to 34 minutes",
+        "35 to 44 minutes",
+        "45 to 59 minutes",
+        "60 or more minutes"
+      ) ~ "Total",
+      mode == "Drove alone:" ~ mode,
+      carpool %in% c(
+        "In 2-person carpool:",
+        "In 3-or-more-person carpool:"
+      ) ~ carpool
+    ),
+    time = case_when(
+      mode == "Total" ~ total,
+      mode == "Drove alone:" ~ carpool,
+      mode == carpool ~ time
+    )
+  ) %>% 
+  filter(!is.na(time)) %>% 
+  select(-total, -carpool) %>% 
+  pivot_wider(
+    names_from = mode,
+    values_from = estimate
+  ) %>% 
+  mutate(
+    perc_veh1 = `Drove alone:`/Total,
+    perc_veh2 = `In 2-person carpool:`/Total,
+    perc_veh3 = `In 3-or-more-person carpool:`/Total
+  )
+```
+
+```{r}
+zip_trips <-
+  full_zip_od_final  %>% 
+  mutate(
+    time = case_when(
+      duration < 10 ~ "Less than 10 minutes",
+      duration < 15 ~ "10 to 14 minutes",
+      duration < 20 ~ "15 to 19 minutes",
+      duration < 25 ~ "20 to 24 minutes",
+      duration < 30 ~ "25 to 29 minutes",
+      duration < 35 ~ "30 to 34 minutes",
+      duration < 45 ~ "35 to 44 minutes",
+      duration < 60 ~ "45 to 59 minutes",
+      TRUE ~ "60 or more minutes"
+    )
+  ) %>% 
+  left_join(
+    travel_time_mode %>% 
+      select(
+        cbg,
+        time,
+        perc_veh1,
+        perc_veh2,
+        perc_veh3
+      ),
+    by = c("cbg", "time")
+  ) %>% 
+  mutate(
+    vehicles = 
+      visits * perc_veh1 + 
+      visits * perc_veh2 / 2 +
+      visits * perc_veh3 / 3,
+    vmt = vehicles * distance *2
+  )
+```
+We used the EMFAC model to calculate vehicle emission standards by downloading bay Area emission rate data for 2021.
+```{r echo = FALSE, results = 'asis'}
+kable(emfac <- 
+  read_csv("/Users/guxm/Documents/GitHub/minxue.github.io/EMFAC2021-ER-202xClass-BayAreaAQMD-2021-Summer-20220206143938.csv", skip = 8) %>% 
+  transmute(
+    Category = `Vehicle Category`,
+    Fuel_Type = Fuel,
+    Percent_Trips = Trips/sum(Trips),
+    Percent_Miles = `Total VMT`/sum(`Total VMT`),
+    `MTCO2_Running_Exhaust` = CO2_RUNEX/`Total VMT`,
+    `MTCO2_Start_Exhaust` = CO2_STREX/Trips
+  )
+,caption = "Emission Factor")
+```
+
+```{r}
+zip_trips_ghg <- 
+  2013:2019 %>% 
+  map_dfr(function(yr){
+    emfac %>%
+      mutate(
+        year = yr,
+    trips = Percent_Trips * sum(zip_trips %>% 
+                                  filter(year == yr) %>% pull(visits), na.rm = T),
+    vmt = Percent_Miles * sum(zip_trips %>% 
+                                  filter(year == yr) %>% pull(vmt), na.rm = T),
+    ghg = vmt*MTCO2_Running_Exhaust + trips*MTCO2_Start_Exhaust*2
+  )
+})
+
+saveRDS(zip_trips_ghg,"zip_trips_ghg.rds")
+zip_trips_ghg <- read_rds("zip_trips_ghg.rds")
+```
+
+```{r}
+zip_trips_ghg_sum<-
+  zip_trips_ghg%>%mutate(type=paste0(Category,",",Fuel_Type))%>%
+  group_by(year)%>%
+  summarise(total_ghg = sum(ghg,na.rm=T))
+```
+
+```{r}
+ggplot(
+  zip_trips_ghg_sum, 
+  aes(
+    x = as.factor(year), 
+    y = total_ghg
+  )
+) + 
+  geom_line(
+    aes(
+      x = year,
+      y = total_ghg
+    )
+  )+
+  labs(x = "Year", y = "value", title = "Vehicle GHG emission in redwood city") 
+```
+
+It can be seen that in 2015, the emission of work traffic decreased slightly, and at other times, it rose sharply. The carbon emission caused by work traffic is becoming more and more important, and it deserves our attention.
+
+# 2
+## 2-a
+Commercial and residential buildings are also a major source of GHG emissions. We use energy data from PG&E, which gives monthly total kWh of electricity and total BTU of natural gas usage by zip code from 2013 to 2019. At the same time, we used EIA emission factors to convert thermal units to carbon dioxide and a google searched factor for Kwh to carbon dioxide to facilitate our GHG calculation.
+```{r,eval=FALSE}
+pge_data <- 
+  2013:2019 %>% 
+  map_dfr(function(yr){
+    
+    factor <- 
+      pge_elec_emissions_factor %>% 
+      filter(year == yr) %>% 
+      pull(factor)
+    
+    1:4 %>% 
+      map_dfr(function(quarter){
+        
+        c("Electric","Gas") %>% 
+          map_dfr(function(type){
+            
+            filename <- 
+              paste0(
+                "/Volumes/GoogleDrive-110193744224122693685/Shared drives/SFBI/Data Library/PG&E/",
+                "PGE_",
+                yr,
+                "_Q",
+                quarter,
+                "_",
+                type,
+                "UsageByZip.csv"
+              )
+            temp <- read_csv(filename)
+            
+            if(yr == 2017 & quarter == 4) {
+              temp <- 
+                temp %>% 
+                filter(MONTH != 9)
+            }
+            
+            temp <-
+              temp %>% 
+              rename_all(toupper) %>% 
+              mutate(
+                TOTALKBTU = ifelse(
+                  substr(CUSTOMERCLASS,1,1) == "E",
+                  TOTALKWH * 3.412,
+                  TOTALTHM * 99.976
+                ),
+                TOTALTCO2E = ifelse(
+                  substr(CUSTOMERCLASS,1,1) == "E",
+                  TOTALKWH/1000 * factor * 0.000453592,
+                  TOTALTHM * 0.00531
+                )
+              ) %>% 
+              select(
+                ZIPCODE,
+                YEAR,
+                MONTH,
+                CUSTOMERCLASS,
+                TOTALKBTU,
+                TOTALTCO2E,
+                TOTALCUSTOMERS
+              )
+            
+          })
+        
+      })
+    
+  })
+```
+
+```{r}
+pge_data <-readRDS("pge_data")
+```
+
+
+```{r}
+pge_data_rwc <-
+  pge_data %>%
+  filter(ZIPCODE %in% c("94061", "94063", "94065")) %>%
+  filter(
+    CUSTOMERCLASS %in% c(
+      "Elec- Commercial",
+      "Elec- Residential",
+      "Gas- Commercial",
+      "Gas- Residential"
+    )
+  ) %>%
+  mutate(ENERGYTYPE = case_when(
+    CUSTOMERCLASS %in%  c("Elec- Commercial",
+                          "Elec- Residential") ~ "Elec",
+    CUSTOMERCLASS %in%  c("Gas- Commercial",
+                          "Gas- Residential") ~ "Gas"
+  )) %>%
+  mutate(
+    BUILDINGTYPE = case_when(
+      CUSTOMERCLASS %in% c("Elec- Commercial",
+                           "Gas- Commercial") ~ "Commercial",
+      CUSTOMERCLASS %in% c("Elec- Residential",
+                           "Gas- Residential") ~ "Residential"
+    )
+  ) %>%
+  group_by(ZIPCODE, ENERGYTYPE, YEAR, BUILDINGTYPE, CUSTOMERCLASS) %>%
+  summarize(
+    TOTALKBTU = sum(TOTALKBTU, na.rm = T),
+    TOTALTCO2E = sum(TOTALTCO2E, na.rm = T),
+    TOTALCUSTOMERS = mean(TOTALCUSTOMERS, na.rm = T)
+  ) %>%
+  group_by(ENERGYTYPE, YEAR, BUILDINGTYPE, CUSTOMERCLASS) %>%
+  summarize(across(c(TOTALKBTU, TOTALTCO2E, TOTALCUSTOMERS),
+                   ~ sum(., na.rm = T)))
+```
+
+```{r}
+ggplot(pge_data_rwc,
+       aes(x = as.factor(YEAR),
+           y = TOTALKBTU / 1000000)) +
+  geom_bar(stat = "identity",
+           aes(fill = CUSTOMERCLASS),
+           position = "dodge") +
+  labs(x = "Year", 
+       y = "GBTU", 
+       title = "Annual Energy Usage in redwood city (in GBTU), 2013 to 2019") +
+  scale_fill_discrete(name = "CUSTOMERCLASS")
+```
+```{r}
+annual_energy <-
+ggplot(
+  pge_data_rwc, 
+  aes(
+    x = as.factor(YEAR), 
+    y = TOTALTCO2E
+  )
+) + 
+  geom_bar(stat = "identity", aes(fill = CUSTOMERCLASS), position = "dodge") + 
+  labs(x = "Year", y = "tCO2e", title = "Annual Energy Usage in redwood city (in tCO2e), 2013 to 2019") + 
+  scale_fill_discrete(name="CUSTOMERCLASS")
+annual_energy
+```
+
+## 2 - b
+To assign residential energy to residents, we obtained the number of residents of Redwood city from ACS.
+To assign commercial energy to residents, we obtained the number of jobs of Redwood city from LODES.
+```{r,eval=FALSE}
+acs_vars_2019_5yr <-
+  listCensusMetadata(
+    name = "2019/acs/acs5",
+    type = "variables"
+  )
+```
+
+
+```{r,eval=FALSE}
+final_result_pop0 <- 2013:2019 %>% 
+  map_dfr(function(yr){
+    getCensus(
+      name = "acs/acs5",
+      vintage = yr,
+      region = "block group:*", 
+      regionin = "state:06+county:081",
+      vars = "B01001_001E"
+    ) %>%
+    mutate(
+      YEAR = yr,
+      cbg =
+        paste0(state,county,tract,block_group)
+    ) %>% 
+    select(YEAR, cbg,  pop = B01001_001E)
+  })
+final_result_pop <- final_result_pop0 %>% 
+  mutate(cbg = as.character(cbg)) %>% 
+  left_join(zip_blocks %>% 
+              select(cbg, 
+                     zip_code = zipcode)%>%
+              st_drop_geometry() %>%
+              filter(!duplicated(cbg))
+              )%>%
+  filter(!is.na(zip_code))
+
+
+final_result_pop <-saveRDS(final_result_pop,"final_result_pop.rds")
+```
+
+```{r}
+final_result_pop <-readRDS("final_result_pop.rds")
+```
+
+
+```{r}
+total_pop_zipcode <-
+  final_result_pop %>%
+  group_by(YEAR,zip_code)%>%
+  summarize(total_pop_zip = sum(pop, na.rm = T))
+
+total_pop_rwc <-
+  total_pop_zipcode%>%
+  ungroup()%>%
+  select(-zip_code)%>%
+  group_by(YEAR)%>%
+  summarise(total_pop_rwc = sum(total_pop_zip, na.rm = T))
+
+```
+
+```{r}
+energy_per_resident <-
+  pge_data_rwc%>%
+  left_join(total_pop_rwc)%>%
+  filter(BUILDINGTYPE == "Residential")%>%
+  mutate(AVGKBTU = TOTALKBTU / total_pop_rwc)%>%
+  group_by(YEAR, ENERGYTYPE) %>% 
+  ggplot(
+    aes(
+      x = as.factor(YEAR), 
+      y = AVGKBTU
+    )
+  ) + 
+  geom_bar(stat = "identity", aes(fill = ENERGYTYPE), position = "dodge") + 
+  labs(x = "Year", y = "energy use per resident", title = "Redwood City annual residential energy use per resident(Btu), 2013 to 2019") + 
+  scale_fill_discrete(name="Type")
+energy_per_resident
+```
+
+After processing the population data, it can be seen that the fluctuation range of residential energy is reduced, indicating that  population is a main driving factor of residential change and justifying the distribution of residential energy to residents. Residential gas emissions are higher than electricity emissions, which may be due to the large demand for heating in winter.
+
+```{r,eval=FALSE}
+zip_jobs <- full_zip_od %>%
+  mutate(
+    h_cbg = substr(h_geocode,1,12),
+    w_cbg = substr(w_geocode,1,12)
+  ) %>%select(-createdate) %>%
+  left_join(zip_blocks %>%
+              select(GEOID10, zipcode), 
+            by = c("w_geocode" = "GEOID10")) %>% 
+  filter(!is.na(zipcode)) %>% 
+  group_by(zipcode,year)%>%
+  # left_join(conversion_table,by= c("w_cbg" = "cbg"))
+  # filter(zipcode %in% rwc_zipcodes$zipcode) %>% group_by(zipcode,year)%>%
+  summarise_at(vars(S000:SI03),sum) %>%
+  select(S000,year,zipcode) %>%
+  ungroup() %>%
+  select(-zipcode) %>%
+  rename(jobs = S000) %>%
+  group_by(year) %>%
+  summarize(num_jobs = sum(jobs)) %>%
+  rename(YEAR = year)
+```
+
+```{r}
+zip_jobs <- readRDS("zip_jobs.rds")
+
+job_rwc<-zip_jobs%>%
+  rename(year=YEAR)%>%
+  rename(JobResidents= num_jobs)
+```
+
+```{r}
+energy_per_job <-
+  pge_data_rwc%>%
+  left_join(job_rwc, by = c("YEAR" = "year"))%>%
+  filter(BUILDINGTYPE == "Commercial")%>%
+  mutate(AVGKBTU = TOTALKBTU / JobResidents)%>%
+  group_by(YEAR, ENERGYTYPE) %>% 
+  ggplot(
+    aes(
+      x = as.factor(YEAR), 
+      y = AVGKBTU
+    )
+  ) + 
+  geom_bar(stat = "identity", aes(fill =ENERGYTYPE), position = "dodge") + 
+  labs(x = "Year", y = "energy use per resident", title = "Redwood City annual commercial energy use per job(Btu), 2013 to 2019") + 
+  scale_fill_discrete(name="Type")
+energy_per_job
+```
+
+Contrary to residential, commercial electricity consumption is larger, but there has been a downward trend in recent years. After eliminating the impact of the number of jobs through job processing, we can analyze that this may be due to an increase in electricity consumption efficiency.
+
+## 2 -  c
+
+Finally, controlling year-to-year changes in HDDs and CDDs will allow for more accurate annual energy consumption comparisons.
+The graph below shows the usage factor trends for energy usage (population for residential energy, jobs for commercial energy, HDD for natural gas, CDD for electricity) from 2013-2019.
+```{r}
+HDD <- read_csv("HDD.csv")
+CDD <- read_csv("CDD.csv")
+```
+
+```{r}
+HDD  <- HDD %>% filter(boundary %in% c(2013:2019)) %>%
+  separate(
+    locagrid,
+    into = c(NA,"CanESM2", NA,NA,NA),
+    sep = ","
+  )%>%
+  rename("YEAR"=boundary)%>%
+  mutate("YEAR" = as.numeric(YEAR))
+```
+
+```{r}
+CDD <- CDD %>% filter(boundary %in% c(2013:2019)) %>%
+  separate(
+    locagrid,
+    into = c(NA,"CanESM2", NA,NA,NA),
+    sep = ","
+  )%>%
+  rename("YEAR"=boundary)%>%
+  mutate("YEAR" = as.numeric(YEAR))
+```
+
+```{r}
+KBTU_resident_CDD <-
+  pge_data_rwc%>%
+  left_join(CDD)%>%
+  left_join(total_pop_rwc)%>%
+  filter(BUILDINGTYPE == "Residential")%>%
+  filter(ENERGYTYPE == "Elec")%>%
+  mutate(AVGKBTU = TOTALKBTU / total_pop_rwc)%>%
+  group_by(YEAR) %>%
+  mutate(KBTU_resident_CDD = AVGKBTU / as.numeric(CanESM2))
+
+KBTU_resident_HDD <-
+  pge_data_rwc%>%
+  left_join(HDD)%>%
+  left_join(total_pop_rwc)%>%
+  filter(BUILDINGTYPE == "Residential")%>%
+  filter(ENERGYTYPE == "Gas")%>%
+  mutate(AVGKBTU = TOTALKBTU / total_pop_rwc)%>%
+  group_by(YEAR) %>%
+  mutate(KBTU_resident_HDD = AVGKBTU / as.numeric(CanESM2))
+```
+
+```{r}
+KBTU_resident <-
+  rbind(KBTU_resident_HDD,KBTU_resident_CDD)%>%
+  mutate(type = 
+           case_when(
+             !is.na(KBTU_resident_CDD) ~ "KBTU_resident_CDD, Elec",
+            is.na(KBTU_resident_CDD) ~ "KBTU_resident_HDD, Gas"
+            )
+  )%>%
+  mutate(value =
+           case_when(type == "KBTU_resident_CDD, Elec" ~ KBTU_resident_CDD,
+                     type == "KBTU_resident_HDD, Gas" ~ KBTU_resident_HDD))
+```
+
+```{r}
+KBTU_job_CDD <-
+  pge_data_rwc%>%
+  left_join(CDD)%>%
+  left_join(zip_jobs)%>%
+  filter(BUILDINGTYPE == "Commercial")%>%
+  filter(ENERGYTYPE == "Elec")%>%
+  mutate(AVGKBTU = TOTALKBTU / num_jobs)%>%
+  group_by(YEAR) %>%
+  mutate(KBTU_job_CDD = AVGKBTU / as.numeric(CanESM2))
+
+KBTU_job_HDD <-
+  pge_data_rwc%>%
+  left_join(HDD)%>%
+  left_join(zip_jobs)%>%
+  filter(BUILDINGTYPE == "Commercial")%>%
+  filter(ENERGYTYPE == "Gas")%>%
+  mutate(AVGKBTU = TOTALKBTU / num_jobs)%>%
+  group_by(YEAR) %>%
+  mutate(KBTU_job_HDD = AVGKBTU / as.numeric(CanESM2))
+```
+
+```{r}
+KBTU_commercial <-
+  rbind(KBTU_job_HDD,KBTU_job_CDD)%>%
+  mutate(type = 
+           case_when(
+             !is.na(KBTU_job_CDD) ~ "KBTU_job_CDD, Elec",
+            is.na(KBTU_job_CDD) ~ "KBTU_job_HDD, Gas"
+            )
+  )%>%
+  mutate(value =
+           case_when(type == "KBTU_job_CDD, Elec" ~ KBTU_job_CDD,
+                     type == "KBTU_job_HDD, Gas" ~ KBTU_job_HDD))
+
+
+```
+
+```{r}
+KBTU_commercial_residential <-
+  rbind(KBTU_commercial,KBTU_resident)
+
+ggplot(
+  KBTU_commercial_residential, 
+  aes(
+    x = as.factor(YEAR), 
+    y = value
+  )
+) + 
+  geom_bar(stat = "identity", aes(fill = type), position = "dodge") + 
+  labs(x = "Year", y = "value", title = "Commercial and residential energy consumption in redwood city") + 
+  scale_fill_discrete(name="type") 
+```
+
+
+
+
+
+#3
+## 3 - a
+```{r}
+zip_trips_ghg_sum<-
+  zip_trips_ghg%>%mutate(type=paste0(Category,",",Fuel_Type))%>%
+  group_by(year)%>%
+  summarise(total_ghg = sum(ghg,na.rm=T))
+
+zip_trips_ghg_sum_co2<-
+  zip_trips_ghg_sum%>%
+  rename(TOTALTCO2E=total_ghg)%>%
+  mutate(type = "vehicle emission")
+```
+```{r}
+pge_data_rwc_co2<-
+  pge_data_rwc%>%
+  ungroup()%>%
+  select(c("YEAR","CUSTOMERCLASS","TOTALTCO2E"))%>%
+  rename(type=CUSTOMERCLASS)%>%rename(year=YEAR)%>%
+  mutate(type = paste0("building emission",",",type))
+```
+
+```{r}
+rwc_ghg <-
+  pge_data_rwc_co2%>%
+  rbind(zip_trips_ghg_sum_co2)%>%
+  mutate(TOTALTCO2E = as.numeric(TOTALTCO2E))%>%
+  mutate(year = as.numeric(year))
+
+  ggplot(
+    rwc_ghg,
+    aes(
+      x = year,
+      y = TOTALTCO2E,
+      fill = type
+    )
+  ) + 
+  geom_area()+
+    labs(x = "year", y = "TOTALTCO2E", title = "Total GHG emission in redwood city, 2013-2019") 
+```
+
+Transportation emissions are lower than building emissions, residential emissions are lower than commercial emissions, and gas emissions are lower than electricity emissions in commercial energy and higher in residential energy.
+It is worth noting that transportation emissions only include emissions from work traffic and is on the increase. Although the amount of CO2 brought by electricity used to be the largest, there is a trend of substantial reduction.
+According to PG&E's official website, PGE will provide customers with cleaner energy. In 2020, approximately 85% of the electricity  supplied to customers were free of greenhouse gases, and we can expect electricity to be cleaner in the future, eventually reaching zero emissions. Since electricity is cleaner than natural gas, residential buildings which contribute most to GHG emission should be encouraged to use heat pumps instead of natural gas for heating to reduce gas usage. To further reduce natural gas heating, residential buildings can be encouraged to utilize passive solar by installing solar panels or thermal mass.
+
+## 3 - b
+We explored potential factors contributing to GHG emissions (population growth, employment growth, commete pattern including EV adoption, heating degree days and cooling degree days) and trended them to predict future GHG emissions trends.
+
+(1) Vehicle Emission
+For commute pattern, we predict that the percent of electric vehicles on the road will increase. Since EMFAC data is unavailable, we predict the adoption of electric vehicles based on market report. Electric vehicles will grow from 0.7% of the global light-duty vehicle (LDV) fleet in 2020 to 31% in 2050, reaching 672 million EVs.(US Energy Information Administration (EIA)). Thus we predict an annual growth rate of 1% in percent_trip and percent_miles in electric vehicles over 2020 to 2050, and the subsequent decline in gasoline vehicles. At the same time, the projected emission rate is unchanged, because we think gasoline cars have less room for improvement given the technology that's out there.
+```{r echo = FALSE, results = 'asis'}
+function_emission<-function(year) {
+emfac <- emfac%>% 
+  mutate(
+    Percent_Trips =
+      case_when(
+        Fuel_Type == "Gasoline" & Category =="LDA" ~ (emfac$Percent_Trips-0.01*(as.numeric(year)-2020)*0.9),
+        Fuel_Type == "Electricity"& Category =="LDA" ~ (emfac$Percent_Trips+0.01*(as.numeric(year)-2020)*0.9),
+        Fuel_Type == "Gasoline" & Category =="LDT1" ~ (emfac$Percent_Trips-0.01*(as.numeric(year)-2020)*0.085),
+        Fuel_Type == "Electricity"& Category =="LDT1" ~ (emfac$Percent_Trips+0.01*(as.numeric(year)-2020)*0.085),
+        TRUE ~ emfac$Percent_Trips
+      ) 
+  )%>% 
+  mutate(
+    Percent_Miles =
+      case_when(
+        Fuel_Type == "Gasoline" & Category =="LDA" ~ (emfac$Percent_Miles-0.01*(as.numeric(year)-2020)*0.9),
+        Fuel_Type == "Electricity"& Category =="LDA" ~ (emfac$Percent_Miles+0.01*(as.numeric(year)-2020)*0.9),
+        Fuel_Type == "Gasoline" & Category =="LDT1" ~ (emfac$Percent_Miles-0.01*(as.numeric(year)-2020)*0.08),
+        Fuel_Type == "Electricity"& Category =="LDT1" ~ (emfac$Percent_Miles+0.01*(as.numeric(year)-2020)*0.08),
+        TRUE ~ emfac$Percent_Miles
+      ) 
+  )%>%mutate(year = year)
+}
+
+years<-seq(2020,2050,by=5)
+result<-NULL
+
+for(year in years) {
+  temp<-function_emission(year)
+  result<-
+    rbind(result,temp)
+}
+
+emfac_total <- 
+  2013:2019 %>% 
+  map_dfr(function(yr){
+    emfac %>%
+      mutate(
+        year = yr)
+})
+emfac_total<- rbind(emfac_total,result)
+
+kable(result %>% filter(year == 2050), caption = "2050 Onroad Emission Factors")
+
+```
+
+We assume the same percentage of solo and carpool commuters as the trip data from #1, and predict that commuting VMT and visits will change linearly based on the 2013-2019 trend. According to the predicted data, VMT and visits increased simultaneously, it can be explained by the growth of the working population and that people are working and living farther apart.
+```{r}
+vmt<- zip_trips %>% group_by(year)%>% summarise(vmt = sum(vmt,na.rm =T))
+visits<- zip_trips %>% group_by(year)%>% summarise(visits = sum(visits,na.rm =T))
+
+model<- lm(vmt ~ year, vmt)
+new_years = data.frame(year = c(2020,2025,2030,2035,2040,2045,2050))
+
+new_years$vmt <-  predict(model,new_years, type = "response" )
+
+vmt<- vmt%>% rbind(new_years)
+
+model <- lm(visits ~ year, visits)
+new_years = data.frame(year = c(2020,2025,2030,2035,2040,2045,2050))
+
+new_years$visits <-  predict(model,new_years, type = "response" )
+
+visits<- visits%>% rbind(new_years)
+
+predict <- vmt %>% left_join(visits)
+```
+
+
+```{r}
+kable(predict, caption = "Work related visits prediction")
+```
+
+```{r}
+zip_trips_predict <- 
+   c(2013,2014,2015,2016,2017,2018,2019,2020,2025,2030,2035,2040,2045,2050) %>% 
+  map_dfr(function(yr){
+    emfac_total %>%filter(year == yr)%>%
+      mutate(
+    trips = Percent_Trips * sum(predict %>% filter(year == yr) %>% pull(visits), na.rm = T),
+    vmt = Percent_Miles * sum(predict %>% filter(year == yr) %>% pull(vmt), na.rm = T),
+    ghg = vmt*MTCO2_Running_Exhaust + trips*MTCO2_Start_Exhaust*2
+  )
+})
+
+
+zip_trips_ghg_total<-
+  zip_trips_predict%>%
+  mutate(type = paste0(Category,",",Fuel_Type))
+  
+```
+
+
+```{r}
+ggplot(
+  zip_trips_ghg_total, 
+  aes(
+    x = as.factor(year), 
+    y = ghg
+  )
+) + 
+  geom_bar(stat = "identity", aes(fill = type), position = "dodge") + 
+  labs(x = "Year", y = "TOTAL CO2E", title = "Vehicle emission in redwood city") + 
+  scale_fill_discrete(name="type") +
+  geom_line(aes(x = "2019"), color = "blue", linetype = "dashed",size=1.5) + 
+  annotate(geom="text", x="2035", y = 1.3,label="prediction after 2019",
+              color="blue")
+```
+
+From the plot we can see that, although the rise in the popularity and number of electric vehicles has helped offset some of the increase in emission brought by the increase in travel, it has not been enough to offset the year-on-year rise in emissions from work trips.In terms of transportation, we think the most important driving factor is commute miles per person by vehicles. To reduce greenhouse gas emissions, better jobs and affordable housing should be provided to avoid long-distance work.Build public transportation into subways and buses in areas with high population density, and introduce policies to encourage taking public transportation or carpooling. At the same time, the growth of electric vehicles, though not as influential as the numbers of commutes will definitely help further reduce carbon emissions.
+
+
+(2) Building emission
+For building emissions, we explored trends in population, number of jobs, and HDD/CDD.
+We collected the total population from ACS and the number of jobs from LODES and performed linear regression to predict the change in population and number of jobs to 2050.
+
+```{r}
+ggplot(
+  data = job_rwc,
+  aes(
+      x = year,
+      y = JobResidents
+    )
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+```{r}
+model_job <- lm(JobResidents ~ year, job_rwc)
+summary(model_job)
+```
+
+
+
+
+
+```{r}
+pop_rwc <- NULL
+for(year in 2013:2019){
+  temp <-
+    getCensus(
+      name = "acs/acs1",
+      vintage = year,
+      vars = c("B01003_001E"),
+      region = "place:60102",
+      regionin = "state:06"
+    ) %>%
+    mutate(
+      Population = B01003_001E,
+      year = year
+    )  
+  pop_rwc <- rbind(pop_rwc,temp)
+
+}
+
+```
+
+```{r}
+ggplot(
+  data = pop_rwc,
+  aes(
+      x = pop_rwc$year,
+      y = pop_rwc$Population
+    )
+) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+```
+```{r}
+model <- lm(Population ~ year, pop_rwc)
+
+summary(model)
+
+```
+```{r}
+new_years = data.frame(year = c(2020,2025,2030,2035,2040,2045,2050))
+
+new_years$population <-  predict(model,new_years, type = "response" )
+
+pop_rwc <- pop_rwc %>% mutate(population = Population)%>% select(year,population)%>% rbind(new_years)
+```
+
+```{r}
+predict_jobs <-readRDS("predice_job.rds")
+job_rwc_all <-
+  job_rwc %>%
+  rbind(predict_jobs)
+```
+
+```{r}
+predict <- pop_rwc%>% left_join(job_rwc_all )
+kable(predict)
+```
+
+
+We use the Cal-Adapt Degree Day tool to collect HDDs and CDDs data in Redwoodcity from 2020 to 2050.
+Data from Cal-Adapt shows that CDD is gradually rising and HDD is gradually decreasing.This is due to the fact that global temperatures are rising, so a hotter summer and more cooling days are needed.This leads to an increase in electricity usage and a decrease in natural gas usage.
+```{r}
+HDD_all <- read_csv("HDD.csv")
+CDD_all <- read_csv("CDD.csv")
+```
+
+```{r echo = FALSE, results = 'asis'}
+HDD_cur_predict  <- HDD_all %>% filter(boundary %in% c(2013:2019,2020,2025,2030,2035,2040,2045,2050)) %>%
+  separate(
+    locagrid,
+    into = c(NA,"CanESM2", NA,NA,NA),
+    sep = ","
+  )%>%
+  rename("YEAR"=boundary)%>%
+  mutate("YEAR" = as.numeric(YEAR))
+
+CDD_cur_predict  <- CDD_all %>% filter(boundary %in% c(2013:2019,2020,2025,2030,2035,2040,2045,2050)) %>%
+  separate(
+    locagrid,
+    into = c(NA,"CanESM2", NA,NA,NA),
+    sep = ","
+  )%>%
+  rename("YEAR"=boundary)%>%
+  mutate("YEAR" = as.numeric(YEAR))
+kable(HDD_cur_predict , caption = "Heating Degree Days")
+```
+
+```{r}
+rwc_predict_GHG <-
+  job_rwc_all%>%
+  rename(jobs = JobResidents)%>%
+  cbind(pop_rwc %>%select(-year))%>%
+  cbind(CDD_cur_predict %>%select(-YEAR)%>%rename(CDD_value = CanESM2))%>%
+  cbind(HDD_cur_predict %>%select(-YEAR)%>%rename(HDD_value = CanESM2))
+```
+
+We assume that PGE changes according to the 2013-2019 trend and make a linear forecast for it. According to the fitting report, by 2050, the power consumption value of PGE will reach a negative number, which means that it has reached 100% clean energy, resulting in zero emissions. So we focus on the GHG emission of gas.
+```{r}
+function_get_predict_co2 <-function(x) {
+  model <- lm(TOTALTCO2E ~ YEAR, pge_data_rwc%>%filter(CUSTOMERCLASS == x))
+  new_years = data.frame(YEAR = c(2020,2025,2030,2035,2040,2045,2050))
+  new_years$TOTALTCO2E <-  predict(model,new_years, type = "response" )
+  new_years<-
+    new_years%>%mutate(CUSTOMERCLASS=x)
+  return(new_years)
+}
+
+model_gas_com<-function_get_predict_co2("Gas- Commercial")
+model_gas_res<-function_get_predict_co2("Gas- Residential")
+predict_co2 <-
+  rbind(model_gas_com,model_gas_res)
+
+pge_data_rwc_cur_predict <-
+  pge_data_rwc%>%
+  ungroup()%>%
+  select(YEAR,CUSTOMERCLASS,TOTALTCO2E)%>%
+  rbind(predict_co2)%>%
+  filter(!CUSTOMERCLASS == "Elec- Commercial")%>%
+  filter(!CUSTOMERCLASS == "Elec- Residential")
+kable(pge_data_rwc_cur_predict,caption = "PG&E Gas CO2 Predict")
+```
+
+```{r}
+GHG_job_HDD <-
+  pge_data_rwc_cur_predict%>%
+  left_join(rwc_predict_GHG%>%rename(YEAR=year))%>%
+  filter(CUSTOMERCLASS == "Gas- Commercial")%>%
+  mutate(AVGTCO2 = TOTALTCO2E / jobs)%>%
+  group_by(YEAR) %>%
+  mutate(GHG_job_CDD = AVGTCO2 / as.numeric(HDD_value))
+
+GHG_pop_HDD <-
+  pge_data_rwc_cur_predict%>%
+  left_join(rwc_predict_GHG%>%rename(YEAR=year))%>%
+  filter(CUSTOMERCLASS == "Gas- Residential")%>%
+  mutate(AVGTCO2 = TOTALTCO2E / population)%>%
+  group_by(YEAR) %>%
+  mutate(GHG_pop_CDD = AVGTCO2 / as.numeric(HDD_value))
+```
+
+```{r}
+GHG_commercial_residential_predict <-
+  rbind(GHG_job_HDD,GHG_pop_HDD)
+
+ggplot(
+  GHG_commercial_residential_predict, 
+  aes(
+    x = as.factor(YEAR), 
+    y = AVGTCO2
+  )
+) + 
+  geom_bar(stat = "identity", aes(fill = CUSTOMERCLASS), position = "dodge") + 
+  labs(x = "Year", y = "CO2E/pop(job)", title = "Commercial and residential energy gas emission in redwood city") + 
+  scale_fill_discrete(name="CUSTOMERCLASS") +
+  geom_line(aes(x = "2019"), color = "blue", linetype = "dashed",size=1.5) + 
+  annotate(geom="text", x="2030", y = 1.3,label="prediction after 2019",
+              color="blue")
+```
+
+Although it is predicted that PGE emissions are expected to rise, the increase is less than the increase in population and job numbers, resulting in a reduction in per capita emissions. The decrease may also be due to global warming causing HDD to decrease and natural gas usage to be decrease. After HDD correction excludes weather effects, we can cunclude that the per capita natural gas consumption is reduced, which may be a result of people switching to electrical energy or due to the increase in the efficiency of natural gas use.
+
+## 3 - c
+
+Scope 3 GHG footprint allocation of household material goods consumption  
+
+Background:
+Scope 1 covers direct emissions from owned or controlled sources. Scope 2, covers indirect emissions from electricity, steam, heating and cooling purchased and consumed by the reporting organization. Scope 3 includes all other indirect emissions that occur in a company's value chain.(US EPA)
+
+Since the ultimate purpose of production is consumption, the ultimate source of carbon emissions should also be attributed partly to consumption.
+If we assume the carbon emission responsibly is correlated to the carbon emission benchmark value of the purchased products. Then we only need to consider the amount of consumption. Then the higher the consumption level, the larger the carbon footprint. Residents with different income levels always show different consumption pattern and typically the richer people are, the more energy they use.
+
+Or we can further consider the consumer's GHG emission responsibility in every step from production to destruction  of a product.
+
+The industrial electricity and other production activities involved in the production of raw materials are ultimately to meet the needs of consumers, but because the producers and consumers of the products are separated in spatial distribution, fact is that carbon emissions and responsible carbon emissions are spatially separated.The carbon footprint of consumer products in one country may fall more in another country, such as the upstream emissions from purchased supplies  included in scope 3 emissions. For example, Apple has many foundries all over the world. In this case, EIO-LCA can be used for this purpose where the calculation method of carbon emission responsibility of each link is determined according to the added product value of each production link.
+
+Business travel /Employee commuting should be shared by the company and employees with a fixed proportion, and this part of the emission data can be processed using LODES data.
+
+Consumers’ transportation and other behaviors during consumption also bring direct carbon emissions, such as driving to the Apple Store, this part should be fully allocated to residents, by using Safegraph data to collect residents’ travel visit data to surrounding facilities (poi). Specific emissions can be calculated by combining travel modes and emission factors.
+
+At the same time, the consumer's commodity consumption will generate indirect emissions, such as shopping mall electricity or gas consumption. The emission and carbon emission responsibility of this part of the commercial building can be shared between the consumer and the shopping mall with a fixed proportion.
+
+The use of sold products is done by consumers. For example, the electric energy needed to charge mobile phones. This part of emission should be totally borne by consumers, which can be calculated by the data of house building emission.
+
+Finally, since it's up to the consumer to decide when to retire a product, but tech companies can also deliberately plan to retire their products by changing their appearance, or updating the product's design or software, and discontinuing support for older models. The carbon emissions from solid waste and water from end-of-life treatment of sold products should be shared by residents and producers.
+
+
+
+
